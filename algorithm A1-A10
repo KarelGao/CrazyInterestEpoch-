@@ -1,0 +1,2266 @@
+# ===== FILE 1/3: main.py =====
+# -*- coding: utf-8 -*-
+"""
+Simulated dataset generator for:
+"NIM-State Robust Allocation Strategy Model"
+(Quarterly, China-like macro + bank balance-sheet proxies)
+
+Outputs (saved to ./sim_data/):
+  - panel_quarterly.csv          : main time-series panel
+  - yc_gov_long.csv              : gov yield curve by maturity (long format)
+  - yc_cred_long.csv             : high-grade credit curve by maturity (long format)
+  - bucket_params.csv            : (omega_i, h_i, rsf_i, D_i) per bucket
+  - weights.csv                  : w_{t} (6 buckets) per quarter
+  - config_meta.json             : metadata (maturities, seed, etc.)
+
+Also returns a dict of DataFrames for direct in-memory use.
+"""
+
+from __future__ import annotations
+import os, json
+import numpy as np
+import pandas as pd
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _ar1(n: int, phi: float, sigma: float, rng: np.random.Generator, x0: float = 0.0) -> np.ndarray:
+    x = np.zeros(n, dtype=float)
+    x[0] = x0
+    eps = rng.normal(0.0, sigma, size=n)
+    for i in range(1, n):
+        x[i] = phi * x[i - 1] + eps[i]
+    return x
+
+
+def simulate_nim_state_data(
+    start: str = "2015Q1",
+    end: str = "2025Q4",
+    seed: int = 42,
+    out_dir: str = "./sim_data",
+    leave_blank_other_assets: bool = True,
+    blank_share_range: tuple[float, float] = (0.03, 0.08),  # leave 3%~8% as "other assets"
+    lpr_scenario: str = "trend",  # 'trend' | 'stage'
+    lpr_stage_levels: tuple[float, ...] = (3.0, 2.5, 2.0, 1.5),
+    lpr_stage_len: int = 8,  # quarters per stage (only for lpr_scenario='stage')
+) -> dict[str, pd.DataFrame]:
+    """
+    Generate simulated data meeting the pseudocode input requirements.
+
+    Parameters
+    ----------
+    start/end : quarterly period labels, e.g. '2015Q1'
+    seed      : random seed for reproducibility
+    out_dir   : folder to save outputs
+    leave_blank_other_assets : if True, six bucket weights sum to <=1
+    blank_share_range : range of "other assets" share (only used if leave_blank_other_assets=True)
+    lpr_scenario : 'trend' (historical-style) or 'stage' (3->2.5->2->1.5)
+    lpr_stage_levels : stage levels for LPR1 (only for lpr_scenario='stage')
+    lpr_stage_len : quarters per stage
+
+    Returns
+    -------
+    dict of DataFrames: panel, yc_gov_long, yc_cred_long, bucket_params, weights
+    """
+    rng = np.random.default_rng(seed)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ------------------------------------------------------------
+    # 0) Time index
+    # ------------------------------------------------------------
+    periods = pd.period_range(start=start, end=end, freq="Q")
+    n = len(periods)
+    dates = periods.to_timestamp(how="end")
+
+    # ------------------------------------------------------------
+    # 1) Macro rates: LPR1, LPR5, DR007
+    # ------------------------------------------------------------
+    t = np.arange(n)
+
+    # Trend helper: monotone-ish decline with mild undulation
+    def _decline_series(start_level, end_level, noise=0.03, cyc=0.05):
+        base = np.linspace(start_level, end_level, n)
+        wave = cyc * np.sin(2*np.pi*t/16.0)  # ~4-year cycle
+        ar = _ar1(n, phi=0.6, sigma=noise, rng=rng, x0=0.0)
+        return base + wave + ar
+
+    # Stage helper: piecewise-constant levels with mild jitter + smoothing
+    def _build_stage_series(stage_levels, stage_len, n, rng, jitter=0.015, smooth=3):
+        x = []
+        for lv in stage_levels:
+            x += [lv] * int(stage_len)
+        x = np.array(x[:n], float)
+        if x.size < n:
+            x = np.pad(x, (0, n - x.size), mode="edge")
+        x = x + rng.normal(0.0, float(jitter), size=n)
+        if smooth and int(smooth) > 1:
+            x = pd.Series(x).rolling(int(smooth), min_periods=1).mean().to_numpy()
+        return x
+
+    if lpr_scenario.lower() == "stage":
+        # Explicit scenario: 3.0 -> 2.5 -> 2.0 -> 1.5 (each lpr_stage_len quarters by default)
+        LPR1 = _build_stage_series(lpr_stage_levels, lpr_stage_len, n, rng, jitter=0.012, smooth=3)
+
+        # LPR5 keeps a term premium over LPR1 (slightly time-varying)
+        term_premium = 0.55 + 0.08*np.sin(2*np.pi*t/18.0) + _ar1(n, 0.5, 0.03, rng)
+        LPR5 = np.clip(LPR1 + term_premium, 1.80, 4.50)
+
+        # DR007 moves below LPR1; clamp tail into a tighter band for realism
+        dr_spread = 1.10 + 0.12*np.sin(2*np.pi*t/14.0) + _ar1(n, 0.4, 0.05, rng)
+        DR007 = np.clip(LPR1 - dr_spread + rng.normal(0, 0.04, n), 0.80, 3.20)
+        if n >= 6:
+            tail = rng.normal(0.0, 0.04, size=6)
+            DR007[-6:] = np.clip(1.55 + tail, 1.35, 1.75)
+    else:
+        # Default: China-like downward trend + cycles (historical-style)
+        # LPR levels (approx reality: higher in 2015-2016, lower by 2024-2025)
+        LPR1 = _decline_series(4.90, 3.10, noise=0.04, cyc=0.06)
+        LPR5 = _decline_series(5.50, 3.60, noise=0.05, cyc=0.07)
+
+        # DR007: higher/volatile earlier, lower and stable around 1.4~1.8 in recent years
+        DR_base = _decline_series(2.80, 1.55, noise=0.06, cyc=0.10)
+        # add occasional liquidity shocks
+        shock = np.zeros(n)
+        shock_idx = rng.choice(np.arange(2, n-2), size=max(2, n//18), replace=False)
+        shock[shock_idx] += rng.normal(0.20, 0.08, size=len(shock_idx))
+        DR007 = np.clip(DR_base + shock, 0.90, 4.50)
+
+        # Enforce end-period realism (recent DR007 tight band)
+        # last 6 quarters clamp gently toward 1.4~1.7 with small noise
+        if n >= 6:
+            tail = rng.normal(0.0, 0.04, size=6)
+            DR007[-6:] = np.clip(1.55 + tail, 1.35, 1.75)
+
+    # ------------------------------------------------------------
+    # 2) Yield curves: gov + high-grade credit curve by maturity
+    #    Store as long format: (date, maturity_year, yld)
+    # ------------------------------------------------------------
+    maturities = np.array([0.25, 0.5, 1, 2, 3, 5, 7, 10], dtype=float)
+
+    # Gov curve: level tied to (LPR1/5 mix) + term premium; slope varies with cycle
+    level = 0.55 * LPR1 + 0.45 * LPR5 - 1.10  # bring gov yields below LPR
+    slope = 0.55 + 0.20 * np.sin(2*np.pi*t/14.0) + _ar1(n, 0.4, 0.05, rng)  # term premium
+    curvature = 0.12 * np.sin(2*np.pi*t/10.0)
+
+    yc_gov = np.zeros((n, len(maturities)))
+    for j, m in enumerate(maturities):
+        # Nelson-Siegel-ish shape (simple)
+        tau = 2.0
+        load1 = (1 - np.exp(-m/tau)) / (m/tau)
+        load2 = load1 - np.exp(-m/tau)
+        y = level + slope * load1 + curvature * load2 + rng.normal(0.0, 0.03, size=n)
+        yc_gov[:, j] = np.clip(y, 0.80, 5.50)
+
+    # Credit curve: gov + spread (spread widens when NIM pressure/regime hardening)
+    spread_base = 0.85 + 0.15*np.sin(2*np.pi*t/12.0) + _ar1(n, 0.5, 0.06, rng)
+
+    # Stage/low-rate pressure proxy: higher when policy rate is lower
+    press = _sigmoid(2.8 * (2.4 - LPR1))
+    spread_base = spread_base + 0.12 * press  # mild widening under stronger NIM pressure
+
+    # allow mild tightening recently
+    if n >= 8:
+        spread_base[-8:] -= np.linspace(0.05, 0.12, 8)
+
+    yc_cred = np.zeros_like(yc_gov)
+    for j, m in enumerate(maturities):
+        term_spread = spread_base + 0.10*np.log1p(m)  # longer tenor a bit wider
+        yc_cred[:, j] = np.clip(yc_gov[:, j] + term_spread, 1.20, 8.50)
+
+    yc_gov_long = pd.DataFrame({
+        "period": np.repeat(periods.astype(str), len(maturities)),
+        "date": np.repeat(dates, len(maturities)),
+        "maturity_year": np.tile(maturities, n),
+        "yld_pct": yc_gov.reshape(-1)
+    })
+
+    yc_cred_long = pd.DataFrame({
+        "period": np.repeat(periods.astype(str), len(maturities)),
+        "date": np.repeat(dates, len(maturities)),
+        "maturity_year": np.tile(maturities, n),
+        "yld_pct": yc_cred.reshape(-1)
+    })
+
+    # ------------------------------------------------------------
+    # 3) Six buckets meta: omega (risk weight), h (haircut), rsf, D (duration proxy)
+    # ------------------------------------------------------------
+    buckets = ["credit", "bond", "ib", "trading", "cb_gov", "wm_fund"]
+    omega = np.array([0.75, 0.25, 0.20, 0.35, 0.00, 0.50], float)   # RWA density proxy
+    hqla_ratio = np.array([0.05, 0.45, 0.20, 0.05, 0.90, 0.05], float)  # HQLA eligibility proxy
+    haircut = np.array([0.08, 0.04, 0.02, 0.12, 0.01, 0.10], float)  # market haircut proxy
+    rsf = np.array([0.85, 0.20, 0.10, 0.30, 0.05, 0.70], float)      # NSFR RSF proxy
+    D = np.array([2.2, 4.8, 0.3, 1.2, 2.0, 2.8], float)              # duration proxy (years)
+
+    bucket_params = pd.DataFrame({
+        "bucket": buckets,
+        "omega_rwa_density": omega,
+        "hqla_ratio": hqla_ratio,
+        "haircut": haircut,
+        "rsf": rsf,
+        "duration_year": D,
+    })
+
+    # ------------------------------------------------------------
+    # 4) Balance sheet scale A_t and growth g_t (RMB bn)
+    # ------------------------------------------------------------
+    A0 = 1200.0  # starting total assets in RMB bn (placeholder scale)
+    g_q = 0.022 + 0.005*np.sin(2*np.pi*t/12.0) + _ar1(n, 0.3, 0.004, rng)
+    g_q = np.clip(g_q, -0.01, 0.06)
+    A = A0 * np.cumprod(1.0 + g_q)
+
+    # ------------------------------------------------------------
+    # 5) Six-bucket weights W_t (sum to <=1 if leave_blank_other_assets=True)
+    # ------------------------------------------------------------
+    # "other assets" blank share
+    if leave_blank_other_assets:
+        blank = rng.uniform(blank_share_range[0], blank_share_range[1], size=n)
+    else:
+        blank = np.zeros(n)
+
+    # baseline bucket shares (rough China-like) + mild dynamics
+    w_credit = 0.46 - 0.06*_sigmoid((4.0 - LPR1)) + 0.02*np.sin(2*np.pi*t/18.0)
+    w_bond   = 0.22 + 0.05*_sigmoid((4.0 - LPR1)) + 0.01*np.sin(2*np.pi*t/20.0)
+    w_ib     = 0.10 + 0.02*np.sin(2*np.pi*t/12.0)
+    w_trd    = 0.05 + 0.01*np.sin(2*np.pi*t/10.0)
+    w_cb     = 0.06 + 0.01*np.sin(2*np.pi*t/16.0)
+    w_wm     = 0.07 + 0.02*_sigmoid((3.6 - LPR1)) + 0.01*np.sin(2*np.pi*t/14.0)
+
+    W_raw = np.vstack([w_credit, w_bond, w_ib, w_trd, w_cb, w_wm]).T
+    W_raw = np.clip(W_raw, 0.01, None)
+
+    # normalize to (1-blank) each period
+    W = (W_raw / W_raw.sum(axis=1, keepdims=True)) * (1.0 - blank.reshape(-1, 1))
+    W = np.clip(W, 0.0, 1.0)
+
+    weights = pd.DataFrame(W, columns=[f"w_{b}" for b in buckets])
+    weights.insert(0, "period", periods.astype(str))
+    weights.insert(1, "date", dates)
+
+    # ------------------------------------------------------------
+    # 6) Funding mix / repricing proxies: alpha_t, r_dep_t
+    #    alpha_t: market-based funding share proxy (rises mildly over time, cyclical)
+    #    deposit proxy: moves slower than DR007; anchored to policy rates
+    # ------------------------------------------------------------
+    alpha = 0.30 + 0.06*np.sin(2*np.pi*t/18.0) + np.linspace(0.00, 0.05, n) + _ar1(n, 0.3, 0.01, rng)
+    alpha = np.clip(alpha, 0.18, 0.48)
+
+    # deposit repricing proxy (pct): sticky; linked to LPR1 with longer lag + dynamic floor
+    dep_base = 0.62 * LPR1 - 0.70  # slightly higher baseline vs prior
+    dep_slow = pd.Series(dep_base).rolling(6, min_periods=1).mean().to_numpy()  # longer lag (was 4)
+    dep_floor = 0.95 + 0.10 * _sigmoid(3.0 * (2.2 - LPR1))  # floor rises mildly when LPR gets very low
+    dep_noise = rng.normal(0.0, 0.025, size=n)
+    r_dep = np.clip(dep_slow + dep_noise, dep_floor, 3.60)
+
+    # liability cost from mechanism (this becomes rL_t)
+    rL = alpha * DR007 + (1.0 - alpha) * r_dep
+    rL = np.clip(rL, 0.80, 4.20)
+
+    # ------------------------------------------------------------
+    # 7) Bucket yields r_{i,t} and avg earning-asset yield rA_t
+    #    r_{i,t} driven by curves + spreads; credit linked to LPR; bonds to gov/cred curve
+    # ------------------------------------------------------------
+    # pick representative tenors
+    gov_5y = yc_gov[:, np.where(maturities == 5)[0][0]]
+    gov_10y = yc_gov[:, np.where(maturities == 10)[0][0]]
+    cred_3y = yc_cred[:, np.where(maturities == 3)[0][0]]
+    cred_5y = yc_cred[:, np.where(maturities == 5)[0][0]]
+
+    # Loss/haircut proxy: higher when rates volatile or credit spread widens
+    vol_proxy = np.abs(np.diff(gov_10y, prepend=gov_10y[0]))
+    spread_proxy = (cred_5y - gov_5y)
+    loss_common = 0.06 * _sigmoid(8*(vol_proxy - np.median(vol_proxy))) + 0.05 * _sigmoid(3*(spread_proxy - np.median(spread_proxy)))
+
+    # bucket yields (pct)
+    r_credit = np.clip(0.92*LPR1 + 0.10*LPR5 - 0.25 + rng.normal(0, 0.08, n) - 0.20*loss_common, 2.00, 6.50)
+    r_bond   = np.clip(0.55*cred_5y + 0.45*gov_10y + 0.15 + rng.normal(0, 0.06, n) - 0.10*loss_common, 1.50, 6.50)
+    r_ib     = np.clip(DR007 + 0.20 + rng.normal(0, 0.05, n), 1.00, 5.50)
+    r_trd    = np.clip(0.55*cred_3y + 0.25*DR007 + 0.20*gov_5y + 0.10 + rng.normal(0, 0.12, n) - 0.35*loss_common, 1.00, 8.00)
+    r_cb     = np.clip(0.80*gov_5y + 0.10 + rng.normal(0, 0.04, n), 1.00, 4.80)
+    r_wm     = np.clip(0.55*cred_5y + 0.25*LPR1 + 0.20*gov_5y + 0.35 + rng.normal(0, 0.10, n) - 0.25*loss_common, 1.50, 7.50)
+
+    # average earning-asset yield rA_t from weights
+    w_mat = W.copy()
+    rA = (
+        w_mat[:, 0]*r_credit
+        + w_mat[:, 1]*r_bond
+        + w_mat[:, 2]*r_ib
+        + w_mat[:, 3]*r_trd
+        + w_mat[:, 4]*r_cb
+        + w_mat[:, 5]*r_wm
+    )
+    # scale to plausible bank-level range
+    rA = np.clip(rA / np.clip(w_mat.sum(axis=1), 0.85, 1.0), 2.30, 5.20)
+
+    # NIM state
+    NIM = np.clip(rA - rL, 0.85, 3.10)
+
+    # ------------------------------------------------------------
+    # 8) Regulatory metrics (CAR/LCR/NSFR) + implied NCO/ASF for mapping
+    # ------------------------------------------------------------
+    # CAR around 12~14.5 with mild down pressure when NIM is low
+    CAR = 13.6 + 0.35*np.sin(2*np.pi*t/20.0) + _ar1(n, 0.4, 0.15, rng) - 0.45*_sigmoid((np.median(NIM)-NIM)*2.0)
+    CAR = np.clip(CAR, 11.5, 15.5)
+
+    # HQLA proxy from weights
+    HQLA = A * (w_mat[:, 0]*hqla_ratio[0] + w_mat[:, 1]*hqla_ratio[1] + w_mat[:, 2]*hqla_ratio[2] +
+                w_mat[:, 3]*hqla_ratio[3] + w_mat[:, 4]*hqla_ratio[4] + w_mat[:, 5]*hqla_ratio[5])
+
+    # LCR: relatively high (150~250), with cycles; then back out NCO = HQLA/LCR
+    LCR = 190 + 35*np.sin(2*np.pi*t/14.0) + _ar1(n, 0.35, 18.0, rng)
+    LCR = np.clip(LCR, 120, 280)
+    NCO = HQLA / (LCR/100.0)
+
+    # NSFR: stable 108~132; back out ASF = NSFR * RSF
+    RSF_amt = A * (w_mat[:, 0]*rsf[0] + w_mat[:, 1]*rsf[1] + w_mat[:, 2]*rsf[2] +
+                   w_mat[:, 3]*rsf[3] + w_mat[:, 4]*rsf[4] + w_mat[:, 5]*rsf[5])
+
+    NSFR = 120 + 6*np.sin(2*np.pi*t/18.0) + _ar1(n, 0.35, 3.0, rng)
+    NSFR = np.clip(NSFR, 105, 135)
+    ASF = (NSFR/100.0) * RSF_amt
+
+    # Optional non-interest items (kept simple but stable)
+    nonint = 0.18 * A / 100.0 + rng.normal(0, 0.35, n)
+    prov = 0.10 * A / 100.0 + rng.normal(0, 0.25, n)
+    cost = 0.14 * A / 100.0 + rng.normal(0, 0.30, n)
+    div = np.clip(0.02 * A / 100.0 + rng.normal(0, 0.05, n), 0.0, None)
+
+    # ------------------------------------------------------------
+    # 9) Assemble panel
+    # ------------------------------------------------------------
+    panel = pd.DataFrame({
+        "period": periods.astype(str),
+        "date": dates,
+
+        "A_total_assets_rmb_bn": A,
+        "g_asset_growth_q": g_q,
+
+        "LPR1_pct": LPR1,
+        "LPR5_pct": LPR5,
+        "DR007_pct": DR007,
+
+        "rA_avg_earning_asset_yield_pct": rA,
+        "rL_avg_interest_bearing_cost_pct": rL,
+        "NIM_state_pct": NIM,
+
+        "alpha_mkt_funding_share_proxy": alpha,
+        "r_dep_deposit_cost_proxy_pct": r_dep,
+
+        "CAR_pct": CAR,
+        "LCR_pct": LCR,
+        "NSFR_pct": NSFR,
+
+        "HQLA_proxy_rmb_bn": HQLA,
+        "NCO_proxy_rmb_bn": NCO,
+        "RSF_proxy_rmb_bn": RSF_amt,
+        "ASF_proxy_rmb_bn": ASF,
+
+        "non_interest_income_proxy_rmb_bn": nonint,
+        "provision_proxy_rmb_bn": prov,
+        "operating_cost_proxy_rmb_bn": cost,
+        "dividend_proxy_rmb_bn": div,
+    })
+
+    # merge weights into panel for convenience
+    panel = panel.merge(weights.drop(columns=["date"]), on="period", how="left")
+
+    # ------------------------------------------------------------
+    # 10) Save files
+    # ------------------------------------------------------------
+    panel_path = os.path.join(out_dir, "panel_quarterly.csv")
+    yc_gov_path = os.path.join(out_dir, "yc_gov_long.csv")
+    yc_cred_path = os.path.join(out_dir, "yc_cred_long.csv")
+    params_path = os.path.join(out_dir, "bucket_params.csv")
+    weights_path = os.path.join(out_dir, "weights.csv")
+    meta_path = os.path.join(out_dir, "config_meta.json")
+
+    panel.to_csv(panel_path, index=False, encoding="utf-8-sig")
+    yc_gov_long.to_csv(yc_gov_path, index=False, encoding="utf-8-sig")
+    yc_cred_long.to_csv(yc_cred_path, index=False, encoding="utf-8-sig")
+    bucket_params.to_csv(params_path, index=False, encoding="utf-8-sig")
+    weights.to_csv(weights_path, index=False, encoding="utf-8-sig")
+
+    meta = {
+        "seed": seed,
+        "start": start,
+        "end": end,
+        "freq": "Q",
+        "maturities_year": maturities.tolist(),
+        "leave_blank_other_assets": leave_blank_other_assets,
+        "blank_share_range": list(blank_share_range),
+        "lpr_scenario": lpr_scenario,
+        "lpr_stage_levels": list(lpr_stage_levels),
+        "lpr_stage_len": int(lpr_stage_len),
+        "notes": {
+            "units": {
+                "rates": "percent",
+                "assets": "RMB billion",
+                "LCR/NSFR/CAR": "percent",
+            },
+            "six_bucket_sum_rule": "sum(w_*) <= 1 when leave_blank_other_assets=True"
+        }
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return {
+        "panel": panel,
+        "yc_gov_long": yc_gov_long,
+        "yc_cred_long": yc_cred_long,
+        "bucket_params": bucket_params,
+        "weights": weights,
+    }
+
+# ============================================================
+# Integrated research system: A1-A10
+# Based on the three user-provided Python files and the appendix
+# pseudocode.  The implementation keeps the original simulated
+# data generator above, then adds reproducible modules and an
+# end-to-end runner.
+# ============================================================
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Iterable, Sequence
+import argparse
+import copy
+import time
+
+from scipy import stats
+from scipy.optimize import minimize, lsq_linear
+from scipy.special import logsumexp
+
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
+
+try:
+    import statsmodels.api as sm
+    STATSMODELS_OK = True
+except Exception:
+    STATSMODELS_OK = False
+
+try:
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_OK = True
+except Exception:
+    MATPLOTLIB_OK = False
+
+try:
+    import cvxpy as cp
+    CVXPY_OK = True
+except Exception:
+    CVXPY_OK = False
+
+
+BUCKETS = ["credit", "bond", "ib", "trading", "cb_gov", "wm_fund"]
+BUCKET_CN = {
+    "credit": "信贷",
+    "bond": "债券及其他债权",
+    "ib": "同业及资金市场",
+    "trading": "交易及衍生品",
+    "cb_gov": "央行及政府类",
+    "wm_fund": "理财/基金/协同",
+}
+
+
+def _as_float_array(x: Any) -> np.ndarray:
+    return np.asarray(x, dtype=float)
+
+
+def _finite_rows(*arrays: np.ndarray) -> np.ndarray:
+    masks = []
+    n = None
+    for arr in arrays:
+        a = np.asarray(arr)
+        if n is None:
+            n = len(a)
+        if a.ndim == 1:
+            masks.append(np.isfinite(a.astype(float)))
+        else:
+            masks.append(np.all(np.isfinite(a.astype(float)), axis=1))
+    if not masks:
+        return np.array([], dtype=bool)
+    out = masks[0].copy()
+    for m in masks[1:]:
+        out &= m
+    return out
+
+
+def _jsonable(obj: Any) -> Any:
+    if isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, pd.DataFrame):
+        return obj.to_dict(orient="records")
+    if isinstance(obj, pd.Series):
+        return obj.to_list()
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    return obj
+
+
+def _write_json(path: str | Path, obj: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_jsonable(obj), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def ols_rss(X: np.ndarray, y: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    X = np.asarray(X, float)
+    y = np.asarray(y, float).reshape(-1)
+    beta = np.linalg.lstsq(X, y, rcond=None)[0]
+    resid = y - X @ beta
+    rss = float(resid @ resid)
+    return rss, beta, resid
+
+
+def project_simplex(v: np.ndarray, target_sum: float = 1.0) -> np.ndarray:
+    """Euclidean projection on {x>=0, sum x=target_sum}."""
+    v = np.asarray(v, float).reshape(-1)
+    if target_sum <= 0:
+        return np.zeros_like(v)
+    u = np.sort(v)[::-1]
+    cssv = np.cumsum(u) - target_sum
+    ind = np.arange(1, len(v) + 1)
+    cond = u - cssv / ind > 0
+    if not np.any(cond):
+        return np.ones_like(v) * target_sum / len(v)
+    rho = ind[cond][-1]
+    theta = cssv[cond][-1] / rho
+    return np.maximum(v - theta, 0.0)
+
+
+def numerical_gradient(fun: Callable[[np.ndarray], float], x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    x = np.asarray(x, float)
+    g = np.zeros_like(x)
+    for i in range(len(x)):
+        h = eps * max(1.0, abs(x[i]))
+        xp = x.copy(); xp[i] += h
+        xm = x.copy(); xm[i] -= h
+        g[i] = (fun(xp) - fun(xm)) / (2 * h)
+    return g
+
+
+def within_demean(v: np.ndarray, groups: Sequence[Any]) -> np.ndarray:
+    v = np.asarray(v, float)
+    g = np.asarray(groups)
+    out = v.copy()
+    for lab in pd.unique(g):
+        idx = np.where(g == lab)[0]
+        if v.ndim == 1:
+            out[idx] = v[idx] - np.nanmean(v[idx])
+        else:
+            out[idx, :] = v[idx, :] - np.nanmean(v[idx, :], axis=0)
+    return out
+
+
+@dataclass
+class ThresholdConfig:
+    trimming: float = 0.10
+    bootstrap_B: int = 199
+    alpha_list: tuple[float, ...] = (0.10, 0.05, 0.01)
+    fe_flag: str = "none"           # none/time/entity/twoway
+    boot_type: str = "wild"         # residual/wild
+    grid_type: str = "quantileGrid" # uniqueQ/quantileGrid
+    grid_points: int = 81
+    seed: int = 2026
+    double_threshold: bool = True
+
+
+@dataclass
+class AllocationConfig:
+    car_min: float = 12.0
+    lcr_min: float = 120.0
+    nsfr_min: float = 105.0
+    duration_cap: float = 4.5
+    trading_cap: float = 0.15
+    # Broad governance bands inherited from the user's original full-stack code.
+    w_lower: tuple[float, ...] = (0.15, 0.10, 0.02, 0.00, 0.02, 0.02)
+    w_upper: tuple[float, ...] = (0.70, 0.55, 0.25, 0.15, 0.20, 0.25)
+    lambda_var: float = 0.35
+    lambda_cap: float = 0.50
+    lambda_liq: float = 0.50
+    lambda_turn: float = 0.10
+    kappa_lcr: float = 1.0
+    kappa_nsfr: float = 1.0
+    capital_shadow_base: float = 1.0
+    safety_car_margin: float = 0.25
+    safety_lcr_margin: float = 5.0
+    safety_nsfr_margin: float = 1.5
+    discount: float = 0.97
+    mpc_horizon: int = 4
+    use_mpc: bool = False
+    use_hmm: bool = True
+    use_bayes: bool = True
+    use_quantile: bool = True
+    use_rl: bool = False
+    q_delta: float = 0.10
+    bandwidth_rho: float = 0.10
+    solver_maxiter: int = 500
+    seed: int = 2026
+
+
+@dataclass
+class StageConfig:
+    persist_k: int = 2
+    # Stage score is ordinal. Lower rate -> larger stage index.
+    lpr_centres: tuple[float, ...] = (4.0, 3.0, 2.0, 1.0, 0.0, -0.5)
+    dr_centres: tuple[float, ...] = (3.0, 2.3, 1.7, 1.2, 0.5, -0.2)
+    y10_centres: tuple[float, ...] = (3.5, 2.8, 2.2, 1.6, 0.8, -0.2)
+    weights: tuple[float, float, float] = (0.60, 0.20, 0.20)
+    nim_thresholds: tuple[float, float, float] = (1.90, 1.80, 1.70)
+    divergence_tolerance: float = 0.50
+
+
+@dataclass
+class SystemConfig:
+    seed: int = 20260213
+    start: str = "2015Q1"
+    end: str = "2025Q4"
+    out_dir: str = "./system_outputs"
+    sim_dir: str = "./sim_data"
+    fast_mode: bool = True
+    threshold: ThresholdConfig = field(default_factory=ThresholdConfig)
+    allocation: AllocationConfig = field(default_factory=AllocationConfig)
+    stage: StageConfig = field(default_factory=StageConfig)
+    # Trigger thresholds are execution inputs, not embedded in A10 itself.
+    trigger_set: dict[str, dict[str, dict[str, float | str]]] = field(default_factory=lambda: {
+        "External": {
+            "LPR1_change": {"type": "abs_change_ge", "value": 0.20},
+            "DR007_change": {"type": "abs_change_ge", "value": 0.15},
+            "Y10_change": {"type": "abs_change_ge", "value": 0.20},
+        },
+        "Operating": {
+            "NIM": {"type": "min", "value": 1.80},
+            "NIM_change": {"type": "change_le", "value": -0.05},
+        },
+        "Constraint": {
+            "CAR": {"type": "min", "value": 12.0},
+            "LCR": {"type": "min", "value": 120.0},
+            "NSFR": {"type": "min", "value": 105.0},
+        },
+    })
+
+
+# ============================================================
+# A1 Hansen threshold regression + bootstrap significance / CI
+# ============================================================
+
+def hansen_threshold_regression(
+    y: Sequence[float],
+    X: Sequence[Sequence[float]],
+    q: Sequence[float],
+    config: ThresholdConfig | None = None,
+    id_t: Sequence[Any] | None = None,
+    time_t: Sequence[Any] | None = None,
+) -> dict[str, Any]:
+    cfg = config or ThresholdConfig()
+    rng = np.random.default_rng(cfg.seed)
+    y = np.asarray(y, float).reshape(-1)
+    X = np.asarray(X, float)
+    if X.ndim == 1:
+        X = X[:, None]
+    q = np.asarray(q, float).reshape(-1)
+    if not (len(y) == len(X) == len(q)):
+        raise ValueError("y, X, q length mismatch")
+
+    mask = _finite_rows(y, X, q)
+    y0, X0, q0 = y[mask], X[mask], q[mask]
+    ids = np.asarray(id_t)[mask] if id_t is not None else None
+    times = np.asarray(time_t)[mask] if time_t is not None else None
+
+    if cfg.fe_flag not in {"none", "time", "entity", "twoway"}:
+        raise ValueError("fe_flag must be none/time/entity/twoway")
+    yfe, Xfe = y0.copy(), X0.copy()
+    if cfg.fe_flag in {"entity", "twoway"}:
+        if ids is None:
+            raise ValueError("id_t required for entity/twoway FE")
+        yfe, Xfe = within_demean(yfe, ids), within_demean(Xfe, ids)
+    if cfg.fe_flag in {"time", "twoway"}:
+        if times is None:
+            raise ValueError("time_t required for time/twoway FE")
+        yfe, Xfe = within_demean(yfe, times), within_demean(Xfe, times)
+
+    T0, k = len(yfe), Xfe.shape[1]
+    if T0 <= 3 * k + 8:
+        raise ValueError(f"too few effective observations for threshold test: T={T0}, k={k}")
+
+    qlow, qhigh = np.quantile(q0, [cfg.trimming, 1 - cfg.trimming])
+    if cfg.grid_type == "uniqueQ":
+        grid = np.unique(q0[(q0 >= qlow) & (q0 <= qhigh)])
+    else:
+        probs = np.linspace(cfg.trimming, 1 - cfg.trimming, cfg.grid_points)
+        grid = np.unique(np.quantile(q0, probs))
+    min_seg = max(k + 2, int(np.ceil(cfg.trimming * T0)))
+    grid = np.array([g for g in grid if np.sum(q0 <= g) >= min_seg and np.sum(q0 > g) >= min_seg], float)
+    if len(grid) < 3:
+        raise ValueError("threshold grid too small after trimming")
+
+    def build_z(gamma: float) -> np.ndarray:
+        i1 = (q0 <= gamma).astype(float)[:, None]
+        i2 = 1.0 - i1
+        return np.hstack([Xfe * i1, Xfe * i2])
+
+    rss_list = []
+    beta_list = []
+    for gamma in grid:
+        rss, beta, _ = ols_rss(build_z(gamma), yfe)
+        rss_list.append(rss); beta_list.append(beta)
+    rss_arr = np.asarray(rss_list)
+    i_hat = int(np.argmin(rss_arr))
+    gamma_hat = float(grid[i_hat])
+    rss_hat = float(rss_arr[i_hat])
+    sigma2_hat = rss_hat / max(T0 - 2 * k, 1)
+
+    rss0, beta0, uhat = ols_rss(Xfe, yfe)
+    den = np.maximum(rss_arr / max(T0 - 2 * k, 1), 1e-15)
+    f_grid = ((rss0 - rss_arr) / k) / den
+    supf_obs = float(np.nanmax(f_grid))
+
+    def draw_resid(u: np.ndarray) -> np.ndarray:
+        uc = u - np.mean(u)
+        if cfg.boot_type == "residual":
+            return rng.choice(uc, size=len(uc), replace=True)
+        return uc * rng.choice([-1.0, 1.0], size=len(uc), replace=True)
+
+    supf_boot = np.empty(cfg.bootstrap_B)
+    suplr_boot = np.empty(cfg.bootstrap_B)
+    for b in range(cfg.bootstrap_B):
+        ustar = draw_resid(uhat)
+        ystar = Xfe @ beta0 + ustar
+        rss0s, _, _ = ols_rss(Xfe, ystar)
+        rsss = np.array([ols_rss(build_z(g), ystar)[0] for g in grid])
+        den_s = np.maximum(rsss / max(T0 - 2 * k, 1), 1e-15)
+        supf_boot[b] = np.max(((rss0s - rsss) / k) / den_s)
+        rmin = np.min(rsss)
+        sig2s = max(rmin / max(T0 - 2 * k, 1), 1e-15)
+        suplr_boot[b] = np.max((rsss - rmin) / sig2s)
+
+    crit_supf = {str(a): float(np.quantile(supf_boot, 1 - a)) for a in cfg.alpha_list}
+    pval = float((np.sum(supf_boot >= supf_obs) + 1) / (len(supf_boot) + 1))
+    decision1 = "单门槛显著" if pval < 0.05 else "单门槛不显著"
+
+    lr_grid = (rss_arr - rss_hat) / max(sigma2_hat, 1e-15)
+    crit_lr = {str(a): float(np.quantile(suplr_boot, 1 - a)) for a in cfg.alpha_list}
+    ci_gamma = {}
+    for a in cfg.alpha_list:
+        ok = grid[lr_grid <= crit_lr[str(a)]]
+        ci_gamma[str(a)] = [float(np.min(ok)), float(np.max(ok))] if len(ok) else [gamma_hat, gamma_hat]
+
+    decision2 = "未执行双门槛检验"
+    f2obs = np.nan; pval2 = np.nan; gamma2_hat = np.nan
+    if cfg.double_threshold and decision1 == "单门槛显著" and T0 > 4 * k + 8:
+        def build_z2(g1: float, g2: float) -> np.ndarray:
+            lo, hi = sorted([g1, g2])
+            i1 = (q0 <= lo).astype(float)[:, None]
+            i2 = ((q0 > lo) & (q0 <= hi)).astype(float)[:, None]
+            i3 = (q0 > hi).astype(float)[:, None]
+            return np.hstack([Xfe * i1, Xfe * i2, Xfe * i3])
+
+        valid_g2 = []
+        rss2 = []
+        for g2 in grid:
+            if abs(g2 - gamma_hat) < 1e-12:
+                continue
+            lo, hi = sorted([gamma_hat, g2])
+            counts = [np.sum(q0 <= lo), np.sum((q0 > lo) & (q0 <= hi)), np.sum(q0 > hi)]
+            if min(counts) < max(k + 2, int(np.ceil(cfg.trimming * T0 / 2))):
+                continue
+            valid_g2.append(g2)
+            rss2.append(ols_rss(build_z2(gamma_hat, g2), yfe)[0])
+        if valid_g2:
+            rss2 = np.asarray(rss2)
+            j = int(np.argmin(rss2))
+            gamma2_hat = float(valid_g2[j])
+            rss2hat = float(rss2[j])
+            f2obs = float(((rss_hat - rss2hat) / k) / max(rss2hat / max(T0 - 3*k, 1), 1e-15))
+
+            z1 = build_z(gamma_hat)
+            rss1_obs, b1, resid1 = ols_rss(z1, yfe)
+            f2boot = []
+            for _ in range(cfg.bootstrap_B):
+                ys = z1 @ b1 + draw_resid(resid1)
+                rss1s = ols_rss(z1, ys)[0]
+                r2s = min(ols_rss(build_z2(gamma_hat, g2), ys)[0] for g2 in valid_g2)
+                f2s = ((rss1s - r2s) / k) / max(r2s / max(T0 - 3*k, 1), 1e-15)
+                f2boot.append(f2s)
+            f2boot = np.asarray(f2boot)
+            pval2 = float((np.sum(f2boot >= f2obs) + 1) / (len(f2boot) + 1))
+            decision2 = "双门槛显著" if pval2 < 0.05 else "双门槛不显著（顺序检验下停止）"
+
+    grid_df = pd.DataFrame({"gamma": grid, "RSS": rss_arr, "F": f_grid, "LR": lr_grid})
+    return {
+        "gammaHat": gamma_hat,
+        "gamma2Hat": gamma2_hat,
+        "CIgamma": ci_gamma,
+        "SupFobs": supf_obs,
+        "pValue": pval,
+        "CritSupF": crit_supf,
+        "CritLR": crit_lr,
+        "Decision1": decision1,
+        "F2obs": f2obs,
+        "pValue2": pval2,
+        "Decision2": decision2,
+        "rssGrid": grid_df,
+        "betaHat": beta_list[i_hat],
+        "T_eff": T0,
+        "k": k,
+    }
+
+
+# ============================================================
+# A2 Granger causality: full sample vs low-rate stages
+# ============================================================
+
+def apply_transform(s: Sequence[float], rule: str | Callable[[np.ndarray], np.ndarray]) -> np.ndarray:
+    a = np.asarray(s, float)
+    if callable(rule):
+        return np.asarray(rule(a), float)
+    if rule == "level":
+        return a.copy()
+    if rule == "diff":
+        return np.diff(a)
+    if rule == "logdiff":
+        if np.any(a <= 0):
+            raise ValueError("logdiff requires positive series")
+        return np.diff(np.log(a))
+    raise ValueError(f"unknown transform: {rule}")
+
+
+def lag_matrix(s: np.ndarray, p: int) -> np.ndarray:
+    s = np.asarray(s, float).reshape(-1)
+    if p <= 0:
+        return np.empty((len(s), 0))
+    if len(s) <= p:
+        return np.empty((0, p))
+    return np.column_stack([s[p-j:len(s)-j] for j in range(1, p+1)])
+
+
+def _align_xy(x: np.ndarray, y: np.ndarray, p: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = min(len(x), len(y))
+    x, y = x[:n], y[:n]
+    return y[p:], lag_matrix(y, p), lag_matrix(x, p)
+
+
+def _info_criterion(rss: float, n: int, k: int, ic_type: str) -> float:
+    rss = max(float(rss), 1e-15)
+    if ic_type.upper() == "AIC":
+        return np.log(rss/n) + 2*k/n
+    return np.log(rss/n) + np.log(n)*k/n
+
+
+def choose_granger_lag(x: np.ndarray, y: np.ndarray, pmax: int = 8, ic_type: str = "BIC") -> int:
+    n = min(len(x), len(y))
+    max_admissible = max(1, min(pmax, (n - 4)//3))
+    scores = []
+    for p in range(1, max_admissible + 1):
+        yd, yl, xl = _align_xy(x, y, p)
+        if len(yd) <= 2*p + 2:
+            continue
+        Z = np.column_stack([np.ones(len(yd)), yl, xl])
+        rss = ols_rss(Z, yd)[0]
+        scores.append((p, _info_criterion(rss, len(yd), Z.shape[1], ic_type)))
+    return min(scores, key=lambda z: z[1])[0] if scores else 1
+
+
+def granger_one_direction(x: np.ndarray, y: np.ndarray, p: int) -> dict[str, float]:
+    yd, yl, xl = _align_xy(x, y, p)
+    n = len(yd)
+    ZU = np.column_stack([np.ones(n), yl, xl])
+    ZR = np.column_stack([np.ones(n), yl])
+    rssu = ols_rss(ZU, yd)[0]
+    rssr = ols_rss(ZR, yd)[0]
+    df1 = p
+    df2 = n - ZU.shape[1]
+    if df2 <= 0 or rssu <= 0:
+        return {"p": p, "F": np.nan, "pValue": np.nan}
+    fstat = max(0.0, ((rssr - rssu)/df1) / (rssu/df2))
+    pval = float(stats.f.sf(fstat, df1, df2))
+    return {"p": p, "F": float(fstat), "pValue": pval}
+
+
+def significance_mark(p: float) -> str:
+    if not np.isfinite(p): return ""
+    if p < 0.01: return "***"
+    if p < 0.05: return "**"
+    if p < 0.10: return "*"
+    return ""
+
+
+def granger_stage_comparison(
+    x_t: Sequence[float], y_t: Sequence[float], stage_t: Sequence[str],
+    p_max: int = 8, ic_type: str = "BIC", transform_rule: str = "level",
+    allow_stage_lag: bool = False,
+) -> pd.DataFrame:
+    x0 = np.asarray(x_t, float); y0 = np.asarray(y_t, float); stage0 = np.asarray(stage_t, object)
+    groups = ["Full", "Enter", "Visible", "Deep"]
+    rows = []
+
+    # Transform full sample once for the globally aligned version.
+    xg, yg = apply_transform(x0, transform_rule), apply_transform(y0, transform_rule)
+    drop = len(x0) - len(xg)
+    sg = stage0[drop:drop+min(len(xg), len(yg))]
+    xg, yg = xg[:len(sg)], yg[:len(sg)]
+
+    for g in groups:
+        raw_idx = np.arange(len(x0)) if g == "Full" else np.where(stage0 == g)[0]
+        if len(raw_idx) < 8:
+            rows.extend([
+                {"Group": g, "Direction": "x -> y", "LagOrder": np.nan, "F": np.nan, "pValue": np.nan, "Sig": "", "N": len(raw_idx)},
+                {"Group": g, "Direction": "y -> x", "LagOrder": np.nan, "F": np.nan, "pValue": np.nan, "Sig": "", "N": len(raw_idx)},
+            ])
+            continue
+        xt = apply_transform(x0[raw_idx], transform_rule)
+        yt = apply_transform(y0[raw_idx], transform_rule)
+        n = min(len(xt), len(yt)); xt, yt = xt[:n], yt[:n]
+        p = choose_granger_lag(xt, yt, p_max, ic_type)
+
+        if allow_stage_lag or g == "Full":
+            out_xy = granger_one_direction(xt, yt, p)
+            out_yx = granger_one_direction(yt, xt, p)
+            for direction, out in [("x -> y", out_xy), ("y -> x", out_yx)]:
+                rows.append({"Group": g, "Direction": direction, "LagOrder": out["p"], "F": out["F"],
+                             "pValue": out["pValue"], "Sig": significance_mark(out["pValue"]), "N": n})
+            continue
+
+        # Global lag construction, then group slice at dependent-variable date.
+        yd, yl, xl = _align_xy(xg, yg, p)
+        stage_dep = sg[p:]
+        idx = np.arange(len(yd)) if g == "Full" else np.where(stage_dep == g)[0]
+        if len(idx) <= 2*p + 2:
+            for direction in ["x -> y", "y -> x"]:
+                rows.append({"Group": g, "Direction": direction, "LagOrder": p, "F": np.nan, "pValue": np.nan, "Sig": "", "N": len(idx)})
+            continue
+        # x -> y
+        ydg, ylg, xlg = yd[idx], yl[idx], xl[idx]
+        ZU = np.column_stack([np.ones(len(idx)), ylg, xlg]); ZR = np.column_stack([np.ones(len(idx)), ylg])
+        rssu, rssr = ols_rss(ZU, ydg)[0], ols_rss(ZR, ydg)[0]
+        df2 = len(idx) - ZU.shape[1]
+        fxy = max(0, ((rssr-rssu)/p)/(rssu/df2)) if df2 > 0 and rssu > 0 else np.nan
+        pxy = float(stats.f.sf(fxy, p, df2)) if np.isfinite(fxy) else np.nan
+        rows.append({"Group": g, "Direction": "x -> y", "LagOrder": p, "F": fxy, "pValue": pxy, "Sig": significance_mark(pxy), "N": len(idx)})
+        # y -> x on same aligned dates.
+        xd = xg[p:][idx]
+        ZU2 = np.column_stack([np.ones(len(idx)), xlg, ylg]); ZR2 = np.column_stack([np.ones(len(idx)), xlg])
+        rssu2, rssr2 = ols_rss(ZU2, xd)[0], ols_rss(ZR2, xd)[0]
+        df22 = len(idx) - ZU2.shape[1]
+        fyx = max(0, ((rssr2-rssu2)/p)/(rssu2/df22)) if df22 > 0 and rssu2 > 0 else np.nan
+        pyx = float(stats.f.sf(fyx, p, df22)) if np.isfinite(fyx) else np.nan
+        rows.append({"Group": g, "Direction": "y -> x", "LagOrder": p, "F": fyx, "pValue": pyx, "Sig": significance_mark(pyx), "N": len(idx)})
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# A3 Shadow-rate state-space model (appendix-specified NS/Kalman proxy)
+# ============================================================
+
+def nelson_siegel_loadings(maturities: np.ndarray, lam: float) -> np.ndarray:
+    m = np.asarray(maturities, float)
+    z = np.maximum(lam*m, 1e-12)
+    l1 = (1 - np.exp(-z))/z
+    l2 = l1 - np.exp(-z)
+    return np.column_stack([np.ones(len(m)), l1, l2])
+
+
+def _interpolate_curve(row: np.ndarray, maturities: np.ndarray) -> np.ndarray:
+    row = np.asarray(row, float).copy()
+    ok = np.isfinite(row)
+    if np.sum(ok) == 0:
+        return np.zeros_like(row)
+    if np.sum(ok) == 1:
+        row[:] = row[ok][0]
+        return row
+    row[~ok] = np.interp(maturities[~ok], maturities[ok], row[ok])
+    return row
+
+
+def _kalman_filter_ns(
+    Y: np.ndarray, maturities: np.ndarray, A: np.ndarray, Q: np.ndarray, R: np.ndarray, lam: float,
+    a0: np.ndarray, P0: np.ndarray, missing_rule: str = "Interpolate",
+) -> dict[str, Any]:
+    Y = np.asarray(Y, float)
+    T, M = Y.shape; N = len(a0)
+    Hfull = nelson_siegel_loadings(maturities, lam)
+    a = np.asarray(a0, float).copy(); P = np.asarray(P0, float).copy()
+    a_pred = np.zeros((T, N)); a_filt = np.zeros((T, N))
+    P_pred = np.zeros((T, N, N)); P_filt = np.zeros((T, N, N))
+    ll = 0.0
+    residual_full = np.full((T, M), np.nan)
+    for t in range(T):
+        ap = A @ a; Pp = A @ P @ A.T + Q
+        yy = Y[t].copy()
+        if missing_rule.lower() == "interpolate":
+            yy = _interpolate_curve(yy, maturities); idx = np.arange(M)
+        else:
+            idx = np.where(np.isfinite(yy))[0]
+            if len(idx) == 0:
+                a, P = ap, Pp
+                a_pred[t], a_filt[t] = ap, a
+                P_pred[t], P_filt[t] = Pp, P
+                continue
+            yy = yy[idx]
+        H = Hfull[idx]; Rt = R[np.ix_(idx, idx)]
+        v = yy - H @ ap
+        S = H @ Pp @ H.T + Rt
+        S = (S + S.T)/2 + 1e-10*np.eye(len(idx))
+        try:
+            Sinv = np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            Sinv = np.linalg.pinv(S)
+        K = Pp @ H.T @ Sinv
+        a = ap + K @ v
+        I = np.eye(N)
+        P = (I - K@H)@Pp@(I-K@H).T + K@Rt@K.T  # Joseph form
+        sign, logdet = np.linalg.slogdet(S)
+        if sign > 0:
+            ll += -0.5*(logdet + v@Sinv@v + len(v)*np.log(2*np.pi))
+        a_pred[t], a_filt[t], P_pred[t], P_filt[t] = ap, a, Pp, P
+        residual_full[t, idx] = v
+    return {"a_pred": a_pred, "a_filt": a_filt, "P_pred": P_pred, "P_filt": P_filt,
+            "loglik": float(ll), "residuals": residual_full, "H": Hfull}
+
+
+def _rts_smoother(filter_out: dict[str, Any], A: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    af = filter_out["a_filt"]; Pf = filter_out["P_filt"]
+    ap = filter_out["a_pred"]; Pp = filter_out["P_pred"]
+    T, N = af.shape
+    ass = af.copy(); Pss = Pf.copy()
+    for t in range(T-2, -1, -1):
+        inv = np.linalg.pinv(Pp[t+1])
+        J = Pf[t] @ A.T @ inv
+        ass[t] = af[t] + J @ (ass[t+1] - ap[t+1])
+        Pss[t] = Pf[t] + J @ (Pss[t+1] - Pp[t+1]) @ J.T
+    return ass, Pss
+
+
+def estimate_shadow_rate(
+    Y: np.ndarray, maturities: Sequence[float], lb: float = 0.0, est_mode: str = "FixParam",
+    param0: dict[str, Any] | None = None, init_state: dict[str, Any] | None = None,
+    missing_rule: str = "Interpolate", smooth: bool = True, short_maturity: float = 0.25,
+    compare_series: dict[str, Sequence[float]] | None = None,
+) -> dict[str, Any]:
+    Y = np.asarray(Y, float); mats = np.asarray(maturities, float)
+    T, M = Y.shape
+    if M != len(mats): raise ValueError("Y maturity dimension mismatch")
+
+    # Obtain a stable data-driven initial state and covariance from cross-sectional NS OLS.
+    lam0 = float((param0 or {}).get("Lambda", 0.7))
+    Yfill = np.vstack([_interpolate_curve(r, mats) for r in Y])
+    H0 = nelson_siegel_loadings(mats, lam0)
+    factors = np.array([np.linalg.lstsq(H0, row, rcond=None)[0] for row in Yfill])
+    if T > 2:
+        phi = []
+        for j in range(3):
+            x, z = factors[:-1, j], factors[1:, j]
+            den = x@x
+            phi.append(float(np.clip((x@z)/den if den>1e-12 else 0.95, -0.995, 0.995)))
+        A0 = np.diag(phi)
+        innov = factors[1:] - factors[:-1] @ A0.T
+        Q0 = np.cov(innov.T) + 1e-5*np.eye(3)
+    else:
+        A0 = 0.95*np.eye(3); Q0 = 1e-3*np.eye(3)
+    fitted = factors @ H0.T
+    e = Yfill - fitted
+    rdiag = np.maximum(np.nanvar(e, axis=0), 1e-4)
+    R0 = np.diag(rdiag)
+
+    p0 = param0 or {}
+    A = np.asarray(p0.get("A", A0), float)
+    Q = np.asarray(p0.get("Q", Q0), float)
+    R = np.asarray(p0.get("R", R0), float)
+    lam = lam0
+    a0 = np.asarray((init_state or {}).get("a0", factors[0]), float)
+    P0 = np.asarray((init_state or {}).get("P0", np.cov(factors.T) + 1e-3*np.eye(3)), float)
+
+    if est_mode.upper() == "MLE":
+        # Parsimonious constrained MLE: diagonal AR(A), diagonal Q/R, lambda.
+        # This mirrors the appendix's reparameterisation idea while remaining robust for small samples.
+        theta0 = np.r_[np.arctanh(np.clip(np.diag(A), -0.98, 0.98)),
+                      np.log(np.maximum(np.diag(Q), 1e-8)),
+                      np.log(np.maximum(np.diag(R), 1e-8)), np.log(max(lam, 1e-3))]
+        def unpack(th):
+            aa = np.diag(np.tanh(th[:3]))
+            qq = np.diag(np.exp(th[3:6]))
+            rr = np.diag(np.exp(th[6:6+M]))
+            llambda = float(np.exp(th[-1]))
+            return aa, qq, rr, llambda
+        def nll(th):
+            aa, qq, rr, llambda = unpack(th)
+            if not (0.02 <= llambda <= 5.0): return 1e9
+            return -_kalman_filter_ns(Y, mats, aa, qq, rr, llambda, a0, P0, missing_rule)["loglik"]
+        opt = minimize(nll, theta0, method="L-BFGS-B", options={"maxiter": 300})
+        if opt.success and np.isfinite(opt.fun):
+            A, Q, R, lam = unpack(opt.x)
+
+    filt = _kalman_filter_ns(Y, mats, A, Q, R, lam, a0, P0, missing_rule)
+    state, Ps = _rts_smoother(filt, A) if smooth else (filt["a_filt"], filt["P_filt"])
+    hs = nelson_siegel_loadings(np.array([short_maturity]), lam)[0]
+    shadow = state @ hs
+    nominal = np.maximum(shadow, lb)
+    yhat = state @ nelson_siegel_loadings(mats, lam).T
+    rmse = np.sqrt(np.nanmean((Y - yhat)**2, axis=0))
+    fitdiag = pd.DataFrame({"maturity_year": mats, "RMSE": rmse})
+    comp = {}
+    if compare_series:
+        for name, ser in compare_series.items():
+            a = np.asarray(ser, float)[:T]
+            idx = np.isfinite(a) & np.isfinite(shadow[:len(a)])
+            if np.sum(idx) >= 3:
+                comp[f"CorrShadow_{name}"] = float(np.corrcoef(shadow[:len(a)][idx], a[idx])[0,1])
+                comp[f"MeanDiffShadow_{name}"] = float(np.mean(shadow[:len(a)][idx] - a[idx]))
+    return {"rShadow": shadow, "rNominal": nominal, "StatePath": state, "StateCov": Ps,
+            "LogLikelihood": filt["loglik"], "FitDiag": fitdiag, "CompareDiag": comp,
+            "Param": {"A": A, "Q": Q, "R": R, "Lambda": lam}, "yHat": yhat}
+
+
+# ============================================================
+# A4 Stage-specific Local Projection
+# ============================================================
+
+def local_projection_stage(
+    rate: Sequence[float], nim: Sequence[float], stage: Sequence[str], hmax: int = 8,
+    p_ctrl: int = 2, x_ctrl: np.ndarray | None = None, transform_rule: str = "level",
+    shock_scale: float = 0.01, ci_level: float = 0.95,
+) -> pd.DataFrame:
+    r0, n0, s0 = np.asarray(rate, float), np.asarray(nim, float), np.asarray(stage, object)
+    r = apply_transform(r0, transform_rule); n = apply_transform(n0, transform_rule)
+    drop = max(len(r0)-len(r), len(n0)-len(n))
+    m = min(len(r), len(n)); r, n = r[:m], n[:m]; s = s0[drop:drop+m]
+    if m < p_ctrl + hmax + 5:
+        hmax = max(1, min(hmax, m - p_ctrl - 5))
+
+    shock = np.diff(r)                   # shock at date t corresponds r[t]-r[t-1]
+    dn = np.diff(n)
+    # t indices on transformed level series. shock[j] is at t=j+1.
+    rows = []
+    zcrit = stats.norm.ppf((1+ci_level)/2)
+    for st in ["Enter", "Visible", "Deep"]:
+        for h in range(hmax):
+            yy=[]; xx=[]
+            for j in range(p_ctrl, len(shock)-h):
+                t = j + 1
+                if s[t] != st: continue
+                # cumulative response in NIM from t-1 to t+h
+                yresp = n[t+h] - n[t-1]
+                controls = []
+                for lag in range(1, p_ctrl+1):
+                    controls.append(shock[j-lag])
+                    controls.append(dn[j-lag])
+                if x_ctrl is not None:
+                    xc = np.asarray(x_ctrl, float)
+                    if xc.ndim == 1: xc = xc[:,None]
+                    original_t = drop + t
+                    for lag in range(1, p_ctrl+1):
+                        oi = original_t-lag
+                        if 0 <= oi < len(xc): controls.extend(xc[oi].tolist())
+                yy.append(yresp); xx.append([1.0, shock[j], *controls])
+            if len(yy) < max(8, len(xx[0])+2 if xx else 8):
+                rows.append({"Stage": st, "Horizon": h, "IRF": np.nan, "SE": np.nan, "CI_low": np.nan, "CI_high": np.nan, "N": len(yy)})
+                continue
+            yv, Xv = np.asarray(yy,float), np.asarray(xx,float)
+            beta = np.linalg.lstsq(Xv, yv, rcond=None)[0]
+            if STATSMODELS_OK:
+                try:
+                    fit = sm.OLS(yv, Xv).fit(cov_type="HAC", cov_kwds={"maxlags": max(1,h+1)})
+                    se = float(fit.bse[1])
+                except Exception:
+                    resid = yv-Xv@beta; s2=(resid@resid)/max(len(yv)-Xv.shape[1],1)
+                    se=float(np.sqrt(max(s2*np.linalg.pinv(Xv.T@Xv)[1,1],0)))
+            else:
+                resid = yv-Xv@beta; s2=(resid@resid)/max(len(yv)-Xv.shape[1],1)
+                se=float(np.sqrt(max(s2*np.linalg.pinv(Xv.T@Xv)[1,1],0)))
+            irf = float(beta[1]*shock_scale); se_scaled = se*abs(shock_scale)
+            rows.append({"Stage":st,"Horizon":h,"IRF":irf,"SE":se_scaled,
+                         "CI_low":irf-zcrit*se_scaled,"CI_high":irf+zcrit*se_scaled,"N":len(yv)})
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# A5 Profitability elasticity under rate-down scenarios
+# ============================================================
+
+def reprice_share(bucket: dict[str, Any], horizon_years: float) -> float:
+    freq = max(float(bucket.get("RepriceFreq", 1.0)), 1e-6)
+    mat = max(float(bucket.get("RemainMat", 1.0)), 1e-6)
+    prepay = max(float(bucket.get("PrepayRate", 0.0)), 0.0)
+    eff_mat = max(1.0/freq, mat)
+    share = 1.0 - np.exp(-horizon_years/eff_mat)
+    return float(np.clip(share + prepay*horizon_years, 0, 1))
+
+
+def profitability_elasticity(
+    delta_r_set: Sequence[float], balance_sheet0: dict[str, float],
+    bucket_a: list[dict[str, Any]], bucket_l: list[dict[str, Any]],
+    beta_range_a: tuple[float,float] = (0.65, 0.95), beta_range_l: tuple[float,float] = (0.20, 0.60),
+    horizon_years: float = 1.0, tax_rate: float = 0.25, capital_rule: str = "EquityFixed",
+) -> dict[str, Any]:
+    A0=float(balance_sheet0["TotalAssets"]); E0=float(balance_sheet0["Equity"])
+    avg_ea=float(balance_sheet0.get("AvgEarningAssets", A0)); profit0=float(balance_sheet0.get("Profit0",0.0))
+    roe0=float(balance_sheet0.get("ROE", profit0/max(E0,1e-12)))
+    payout=float(balance_sheet0.get("PayoutRatio",0.30))
+    scenarios=[]; details=[]
+    cases=[("Low",beta_range_a[0],beta_range_l[0]),
+           ("Base",np.mean(beta_range_a),np.mean(beta_range_l)),
+           ("High",beta_range_a[1],beta_range_l[1])]
+    for dr in delta_r_set:
+        for tag, ba, bl in cases:
+            asset_detail=[]; liab_detail=[]
+            dint_income=0.0; dint_expense=0.0
+            for b in bucket_a:
+                sh=reprice_share(b,horizon_years); dy=ba*dr*sh; c=float(b["Balance"])*dy
+                dint_income += c
+                asset_detail.append({"Bucket":b.get("Name","asset"),"Balance":b["Balance"],"Share":sh,"Beta":ba,"DeltaYield":dy,"DeltaIntIncome":c})
+            for b in bucket_l:
+                sh=reprice_share(b,horizon_years); raw=bl*dr*sh
+                base=float(b.get("CostRate0",0.0)); floor=float(b.get("CostFloor",0.0))
+                new=max(base+raw,floor); dc=new-base; c=float(b["Balance"])*dc
+                dint_expense += c
+                liab_detail.append({"Bucket":b.get("Name","liability"),"Balance":b["Balance"],"Share":sh,"Beta":bl,"CostFloor":floor,"DeltaCost":dc,"DeltaIntExpense":c})
+            dnii=dint_income-dint_expense; dprofit=dnii*(1-tax_rate)
+            dnim=dnii/max(avg_ea,1e-12); droa=dprofit/max(A0,1e-12)
+            if capital_rule == "EquityFixed":
+                droe=dprofit/max(E0,1e-12)
+            else:
+                E1=E0+dprofit*(1-payout)
+                droe=(profit0+dprofit)/max(E1,1e-12)-roe0
+            scenarios.append({"DeltaRate":dr,"Case":tag,"DeltaNII":dnii,"DeltaNIM":dnim,"DeltaROA":droa,"DeltaROE":droe})
+            details.append({"DeltaRate":dr,"Case":tag,"AssetDetail":asset_detail,"LiabDetail":liab_detail})
+    scen=pd.DataFrame(scenarios)
+    plot=scen[scen["Case"]=="Base"][["DeltaRate","DeltaNIM","DeltaROE"]].reset_index(drop=True)
+    return {"ScenarioTable":scen,"DetailTable":details,"PlotData":plot}
+
+# ============================================================
+# A6 Core allocation system
+#   - HMM regime learning
+#   - Bayesian/Kalman parameter drift
+#   - Quantile forecasting
+#   - Calibrated CAR/LCR/NSFR mapping
+#   - Feasible-region / bandwidth / shadow-price diagnostics
+#   - Stock-increment dual track
+#   - Optional MPC and governance-safe Q-learning penalty tuner
+# ============================================================
+
+@dataclass
+class GaussianHMM:
+    n_states: int
+    n_dim: int
+    pi: np.ndarray
+    A: np.ndarray
+    mu: np.ndarray
+    Sigma: np.ndarray
+
+    def _logpdf_matrix(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X, float)
+        T = len(X); out = np.empty((T, self.n_states))
+        for k in range(self.n_states):
+            S = (self.Sigma[k] + self.Sigma[k].T)/2 + 1e-8*np.eye(self.n_dim)
+            sign, logdet = np.linalg.slogdet(S)
+            inv = np.linalg.pinv(S)
+            xc = X - self.mu[k]
+            q = np.einsum("ti,ij,tj->t", xc, inv, xc)
+            out[:,k] = -0.5*(self.n_dim*np.log(2*np.pi) + logdet + q)
+        return out
+
+    def forward_backward(self, X: np.ndarray) -> tuple[np.ndarray,np.ndarray,float]:
+        X=np.asarray(X,float); T=len(X); K=self.n_states
+        logB=self._logpdf_matrix(X)
+        logA=np.log(np.clip(self.A,1e-15,None)); logpi=np.log(np.clip(self.pi,1e-15,None))
+        la=np.empty((T,K)); lb=np.zeros((T,K))
+        la[0]=logpi+logB[0]
+        for t in range(1,T):
+            la[t]=logB[t]+logsumexp(la[t-1][:,None]+logA,axis=0)
+        ll=float(logsumexp(la[-1]))
+        for t in range(T-2,-1,-1):
+            lb[t]=logsumexp(logA+logB[t+1][None,:]+lb[t+1][None,:],axis=1)
+        lg=la+lb-ll
+        gamma=np.exp(lg); gamma/=np.clip(gamma.sum(axis=1,keepdims=True),1e-15,None)
+        xi=np.empty((max(T-1,0),K,K))
+        for t in range(T-1):
+            lx=la[t][:,None]+logA+logB[t+1][None,:]+lb[t+1][None,:]-ll
+            x=np.exp(lx); xi[t]=x/np.clip(x.sum(),1e-15,None)
+        return gamma,xi,ll
+
+    def em_train(self, X: np.ndarray, n_iter: int=60, reg: float=1e-4, tol: float=1e-6) -> float:
+        X=np.asarray(X,float); last=-np.inf
+        for _ in range(n_iter):
+            gamma,xi,ll=self.forward_backward(X)
+            self.pi=np.clip(gamma[0],1e-12,None); self.pi/=self.pi.sum()
+            counts=xi.sum(axis=0)+1e-8
+            self.A=counts/counts.sum(axis=1,keepdims=True)
+            for k in range(self.n_states):
+                w=gamma[:,k]; sw=max(w.sum(),1e-12)
+                m=(w[:,None]*X).sum(axis=0)/sw
+                xc=X-m
+                S=np.einsum("t,ti,tj->ij",w,xc,xc)/sw + reg*np.eye(self.n_dim)
+                self.mu[k]=m; self.Sigma[k]=S
+            if np.isfinite(last) and abs(ll-last)<tol: break
+            last=ll
+        return float(last)
+
+
+def init_hmm(X: np.ndarray, n_states: int=3, seed: int=0) -> GaussianHMM:
+    rng=np.random.default_rng(seed); X=np.asarray(X,float); T,d=X.shape
+    # deterministic-ish quantile centroids along first principal component for stable starts
+    Xc=X-X.mean(axis=0); u,s,v=np.linalg.svd(Xc,full_matrices=False)
+    score=Xc@v[0] if len(v) else np.arange(T)
+    qs=np.quantile(score,np.linspace(0.15,0.85,n_states))
+    idx=[int(np.argmin(abs(score-q))) for q in qs]
+    mu=X[idx].copy()
+    base=np.cov(X.T) if T>2 else np.eye(d)
+    if np.ndim(base)==0: base=np.eye(d)*float(base)
+    Sigma=np.array([base+1e-3*np.eye(d) for _ in range(n_states)])
+    A=np.full((n_states,n_states),0.10/max(n_states-1,1))
+    np.fill_diagonal(A,0.90 if n_states>1 else 1.0)
+    A=A/A.sum(axis=1,keepdims=True)
+    return GaussianHMM(n_states,d,np.ones(n_states)/n_states,A,mu,Sigma)
+
+
+def bayes_transition_mean(xi: np.ndarray, alpha0: float=1.0) -> np.ndarray:
+    if len(xi)==0: return np.ones((1,1))
+    counts=xi.sum(axis=0)+alpha0
+    return counts/counts.sum(axis=1,keepdims=True)
+
+
+def build_hmm_features(panel: pd.DataFrame, params: pd.DataFrame) -> tuple[np.ndarray,list[str]]:
+    df=panel.copy()
+    wcols=[f"w_{b}" for b in BUCKETS]
+    omega=params.set_index("bucket").loc[BUCKETS,"omega_rwa_density"].to_numpy(float)
+    W=df[wcols].to_numpy(float)
+    rwa_int=W@omega
+    dw=np.r_[0.0,np.sum(np.abs(np.diff(W,axis=0)),axis=1)]
+    feats=np.column_stack([
+        df["NIM_state_pct"].to_numpy(float),
+        np.r_[0.0,np.diff(df["NIM_state_pct"].to_numpy(float))],
+        df["CAR_pct"].to_numpy(float),
+        df["LCR_pct"].to_numpy(float),
+        df["NSFR_pct"].to_numpy(float),
+        np.r_[0.0,np.diff(rwa_int)],
+        dw,
+    ])
+    names=["NIM","dNIM","CAR","LCR","NSFR","dRWAint","dW"]
+    return feats,names
+
+
+def map_hmm_regimes(hmm: GaussianHMM, scaler: StandardScaler, feature_names: list[str]) -> dict[int,str]:
+    # Convert state means back to original units, then construct a stress score.
+    orig=scaler.inverse_transform(hmm.mu)
+    idx={n:i for i,n in enumerate(feature_names)}
+    # Standardise state means across states for score so units do not dominate.
+    z=(orig-orig.mean(axis=0))/np.where(orig.std(axis=0)>1e-9,orig.std(axis=0),1.0)
+    stress=(-z[:,idx["NIM"]]-0.7*z[:,idx["CAR"]]-0.35*z[:,idx["LCR"]]-0.45*z[:,idx["NSFR"]]
+            +0.25*z[:,idx["dRWAint"]]+0.20*z[:,idx["dW"]])
+    order=np.argsort(stress) # low stress -> controllable
+    labels=["controllable","explicit","hardening"]
+    return {int(k):labels[min(i,len(labels)-1)] for i,k in enumerate(order)}
+
+
+def dynamic_bayesian_nim_regression(panel: pd.DataFrame, regime_hard_prob: np.ndarray | None=None) -> dict[str,Any]:
+    """Kalman dynamic linear regression for drifting repricing/stickiness parameters."""
+    y=panel["NIM_state_pct"].to_numpy(float)
+    X=np.column_stack([
+        np.ones(len(panel)),
+        panel["LPR1_pct"].to_numpy(float),
+        panel["DR007_pct"].to_numpy(float),
+        panel["r_dep_deposit_cost_proxy_pct"].to_numpy(float),
+        panel["alpha_mkt_funding_share_proxy"].to_numpy(float),
+    ])
+    d=X.shape[1]; theta=np.linalg.lstsq(X,y,rcond=None)[0]; P=np.eye(d)*5.0
+    R=max(np.var(y-X@theta),1e-3); base_q=2e-4
+    means=[]; covs=[]; pred=[]; pred_var=[]
+    for t in range(len(y)):
+        hp=float(regime_hard_prob[t]) if regime_hard_prob is not None else 0.0
+        Q=np.eye(d)*base_q*(1+4*hp)
+        Pp=P+Q; tp=theta
+        x=X[t]
+        yp=float(x@tp); S=float(x@Pp@x+R)
+        K=(Pp@x)/max(S,1e-12)
+        theta=tp+K*(y[t]-yp); P=(np.eye(d)-np.outer(K,x))@Pp
+        means.append(theta.copy()); covs.append(P.copy())
+        # one-step predictive using current regressors as random-walk proxy
+        pred.append(float(x@theta)); pred_var.append(float(x@P@x+R))
+    return {"theta":np.asarray(means),"P":np.asarray(covs),"pred_mean":np.asarray(pred),
+            "pred_var":np.asarray(pred_var),"feature_names":["const","LPR1","DR007","r_dep","alpha"],"R":R}
+
+
+def _curve_factors(yc_gov: pd.DataFrame, panel: pd.DataFrame) -> pd.DataFrame:
+    piv=yc_gov.pivot(index="period",columns="maturity_year",values="yld_pct")
+    out=pd.DataFrame(index=panel["period"].astype(str))
+    mats=np.array(piv.columns,float)
+    for p in out.index:
+        row=piv.loc[p].to_numpy(float) if p in piv.index else np.full(len(mats),np.nan)
+        row=_interpolate_curve(row,mats)
+        out.loc[p,"curve_level"]=float(np.mean(row))
+        out.loc[p,"curve_slope"]=float(row[-1]-row[np.argmin(abs(mats-1.0))])
+        out.loc[p,"curve_curvature"]=float(2*row[np.argmin(abs(mats-5.0))]-row[0]-row[-1])
+    return out.reset_index(drop=True)
+
+
+def build_forecast_features(panel: pd.DataFrame, yc_gov: pd.DataFrame, gamma: np.ndarray | None=None) -> tuple[np.ndarray,list[str]]:
+    cf=_curve_factors(yc_gov,panel)
+    cols=["LPR1_pct","LPR5_pct","DR007_pct","alpha_mkt_funding_share_proxy","g_asset_growth_q"]
+    X=[panel[c].to_numpy(float) for c in cols]
+    names=cols.copy()
+    for c in ["curve_level","curve_slope","curve_curvature"]:
+        X.append(cf[c].to_numpy(float)); names.append(c)
+    for b in BUCKETS:
+        X.append(panel[f"w_{b}"].to_numpy(float)); names.append(f"w_{b}")
+    if gamma is not None:
+        for j in range(gamma.shape[1]):
+            X.append(gamma[:,j]); names.append(f"regime_p{j}")
+    return np.column_stack(X),names
+
+
+def quantile_forecast_latest(
+    panel: pd.DataFrame, yc_gov: pd.DataFrame, gamma: np.ndarray | None=None,
+    quantiles: tuple[float,...]=(0.10,0.50,0.90), seed: int=0,
+) -> dict[str,dict[float,float]]:
+    X,_=build_forecast_features(panel,yc_gov,gamma)
+    targets=["NIM_state_pct","CAR_pct","LCR_pct","NSFR_pct"]
+    out={}
+    if len(panel)<12: return out
+    Xtr=X[:-1]; xlast=X[-1:]
+    for target in targets:
+        y=panel[target].to_numpy(float)[1:] # t target from t-1 features
+        Xuse=Xtr[:len(y)]
+        pred={}
+        for q in quantiles:
+            mdl=GradientBoostingRegressor(loss="quantile",alpha=q,n_estimators=150,max_depth=2,
+                                          learning_rate=0.04,random_state=seed)
+            mdl.fit(Xuse,y)
+            pred[q]=float(mdl.predict(xlast)[0])
+        out[target]=pred
+    return out
+
+
+def derive_bucket_yields(panel: pd.DataFrame, yc_gov: pd.DataFrame, yc_cred: pd.DataFrame) -> pd.DataFrame:
+    """Reconstruct the six bucket yields from the same economic logic as main.py."""
+    g=yc_gov.pivot(index="period",columns="maturity_year",values="yld_pct")
+    c=yc_cred.pivot(index="period",columns="maturity_year",values="yld_pct")
+    rows=[]
+    for _,r in panel.iterrows():
+        p=str(r["period"])
+        def get(piv,m):
+            mats=np.array(piv.columns,float); row=_interpolate_curve(piv.loc[p].to_numpy(float),mats)
+            return float(np.interp(m,mats,row))
+        gov5,gov10,cred3,cred5=get(g,5),get(g,10),get(c,3),get(c,5)
+        L1=float(r["LPR1_pct"]); L5=float(r["LPR5_pct"]); dr=float(r["DR007_pct"])
+        vals={
+            "credit":0.92*L1+0.10*L5-0.25,
+            "bond":0.55*cred5+0.45*gov10+0.15,
+            "ib":dr+0.20,
+            "trading":0.55*cred3+0.25*dr+0.20*gov5+0.10,
+            "cb_gov":0.80*gov5+0.10,
+            "wm_fund":0.55*cred5+0.25*L1+0.20*gov5+0.35,
+        }
+        rows.append(vals)
+    return pd.DataFrame(rows,index=panel.index)
+
+
+@dataclass
+class RegulatoryMap:
+    A_total: float
+    capital_amt: float
+    nco_amt: float
+    asf_amt: float
+    omega: np.ndarray
+    hqla: np.ndarray
+    rsf: np.ndarray
+    duration: np.ndarray
+    target_sum: float
+
+    @classmethod
+    def calibrate(cls,row: pd.Series,w_anchor: np.ndarray,params: pd.DataFrame,target_sum: float | None = None):
+        pp=params.set_index("bucket").loc[BUCKETS]
+        omega=pp["omega_rwa_density"].to_numpy(float)
+        hqla=pp["hqla_ratio"].to_numpy(float)
+        rsf=pp["rsf"].to_numpy(float)
+        duration=pp["duration_year"].to_numpy(float)
+        A=float(row["A_total_assets_rmb_bn"]); target=float(np.sum(w_anchor) if target_sum is None else target_sum)
+        rwa=max(A*(omega@w_anchor),1e-8)
+        cap=float(row["CAR_pct"])/100*rwa
+        hq_amt=max(A*(hqla@w_anchor),1e-8)
+        nco=hq_amt/max(float(row["LCR_pct"])/100,1e-6)
+        rsf_amt=max(A*(rsf@w_anchor),1e-8)
+        asf=float(row["NSFR_pct"])/100*rsf_amt
+        return cls(A,cap,nco,asf,omega,hqla,rsf,duration,target)
+
+    def metrics(self,w: np.ndarray) -> dict[str,float]:
+        w=np.asarray(w,float)
+        rwa=max(self.A_total*(self.omega@w),1e-10)
+        h=max(self.A_total*(self.hqla@w),1e-10)
+        rs=max(self.A_total*(self.rsf@w),1e-10)
+        return {
+            "CAR":100*self.capital_amt/rwa,
+            "LCR":100*h/max(self.nco_amt,1e-10),
+            "NSFR":100*self.asf_amt/rs,
+            "duration":float((self.duration@w)/max(np.sum(w),1e-10)),
+            "RWA_intensity":float(self.omega@w),
+            "HQLA_ratio":float(self.hqla@w),
+            "RSF_intensity":float(self.rsf@w),
+        }
+
+
+def effective_constraint_floors(row: pd.Series,cfg: AllocationConfig,qforecast: dict[str,dict[float,float]]|None=None) -> dict[str,float]:
+    floors={"CAR":cfg.car_min,"LCR":cfg.lcr_min,"NSFR":cfg.nsfr_min}
+    if not qforecast: return floors
+    mapping={"CAR":"CAR_pct","LCR":"LCR_pct","NSFR":"NSFR_pct"}
+    for key,col in mapping.items():
+        if col in qforecast and cfg.q_delta in qforecast[col]:
+            qlow=float(qforecast[col][cfg.q_delta]); current=float(row[col])
+            uncertainty=max(0.0,current-qlow)
+            floors[key]+=uncertainty
+    return floors
+
+
+def allocation_constraints(reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
+                           w_lower: np.ndarray,w_upper: np.ndarray) -> list[dict[str,Any]]:
+    cons=[
+        {"type":"eq","fun":lambda w: np.sum(w)-reg.target_sum},
+        {"type":"ineq","fun":lambda w: reg.metrics(w)["CAR"]-floors["CAR"]},
+        {"type":"ineq","fun":lambda w: reg.metrics(w)["LCR"]-floors["LCR"]},
+        {"type":"ineq","fun":lambda w: reg.metrics(w)["NSFR"]-floors["NSFR"]},
+        {"type":"ineq","fun":lambda w: cfg.duration_cap-reg.metrics(w)["duration"]},
+        {"type":"ineq","fun":lambda w: cfg.trading_cap-w[3]},
+    ]
+    return cons
+
+
+def feasible_slacks(w: np.ndarray,reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
+                    w_lower: np.ndarray,w_upper: np.ndarray) -> dict[str,float]:
+    m=reg.metrics(w)
+    d={
+        "CAR":m["CAR"]-floors["CAR"],"LCR":m["LCR"]-floors["LCR"],"NSFR":m["NSFR"]-floors["NSFR"],
+        "duration":cfg.duration_cap-m["duration"],"trading":cfg.trading_cap-w[3],
+        "lower_min":float(np.min(w-w_lower)),"upper_min":float(np.min(w_upper-w)),
+        "sum_error":float(abs(np.sum(w)-reg.target_sum)),
+    }
+    return d
+
+
+def is_feasible(w: np.ndarray,reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
+                w_lower: np.ndarray,w_upper: np.ndarray,tol: float=1e-6) -> bool:
+    s=feasible_slacks(w,reg,cfg,floors,w_lower,w_upper)
+    return (min(s[k] for k in ["CAR","LCR","NSFR","duration","trading","lower_min","upper_min"])>=-tol
+            and s["sum_error"]<=1e-5)
+
+
+def project_to_feasible(w0: np.ndarray,reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
+                        w_lower: np.ndarray,w_upper: np.ndarray) -> tuple[np.ndarray,str]:
+    bounds=list(zip(w_lower,w_upper)); cons=allocation_constraints(reg,cfg,floors,w_lower,w_upper)
+    x0=np.clip(w0,w_lower,w_upper)
+    x0=project_simplex(x0,reg.target_sum)
+    # projection can violate bounds after simplex; use SLSQP from clipped normalized point.
+    res=minimize(lambda w: float(np.sum((w-w0)**2)),x0,method="SLSQP",bounds=bounds,constraints=cons,
+                 options={"maxiter":cfg.solver_maxiter,"ftol":1e-11,"disp":False})
+    if res.success and is_feasible(res.x,reg,cfg,floors,w_lower,w_upper,1e-4): return res.x,"projected"
+    # fallback minimise squared violations + distance
+    def penalty(w):
+        m=reg.metrics(w)
+        v=[max(0,floors["CAR"]-m["CAR"]),max(0,floors["LCR"]-m["LCR"]),max(0,floors["NSFR"]-m["NSFR"]),
+           max(0,m["duration"]-cfg.duration_cap),max(0,w[3]-cfg.trading_cap),abs(np.sum(w)-reg.target_sum)]
+        return np.sum((w-w0)**2)+1e4*np.sum(np.square(v))
+    res2=minimize(penalty,x0,method="SLSQP",bounds=bounds,options={"maxiter":cfg.solver_maxiter,"ftol":1e-11})
+    return np.asarray(res2.x,float),("projected_penalty" if res2.success else "projection_failed")
+
+
+def portfolio_utility(w: np.ndarray,mu: np.ndarray,Sigma: np.ndarray,w_prev: np.ndarray,
+                      reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
+                      lambdas: tuple[float,float,float] | None=None) -> float:
+    lv,lc,ll=lambdas or (cfg.lambda_var,cfg.lambda_cap,cfg.lambda_liq)
+    w=np.asarray(w,float); m=reg.metrics(w)
+    ret=float(mu@w); var=float(w@Sigma@w); turn=float(np.sum(np.abs(w-w_prev)))
+    cap_cost=cfg.capital_shadow_base*m["RWA_intensity"]
+    lcr_soft=floors["LCR"]+cfg.safety_lcr_margin; nsfr_soft=floors["NSFR"]+cfg.safety_nsfr_margin
+    liq=(max(0,lcr_soft-m["LCR"])/100)**2*cfg.kappa_lcr+(max(0,nsfr_soft-m["NSFR"])/100)**2*cfg.kappa_nsfr
+    car_soft=floors["CAR"]+cfg.safety_car_margin
+    cap_near=(max(0,car_soft-m["CAR"])/100)**2
+    return ret-lv*var-lc*(cap_cost+cap_near)-ll*liq-cfg.lambda_turn*turn
+
+
+def solve_weight_utility(w_anchor: np.ndarray,mu: np.ndarray,Sigma: np.ndarray,reg: RegulatoryMap,
+                         cfg: AllocationConfig,floors: dict[str,float],w_lower: np.ndarray,w_upper: np.ndarray,
+                         lambdas: tuple[float,float,float]|None=None) -> tuple[np.ndarray,dict[str,Any]]:
+    anchor,status=project_to_feasible(w_anchor,reg,cfg,floors,w_lower,w_upper)
+    cons=allocation_constraints(reg,cfg,floors,w_lower,w_upper); bounds=list(zip(w_lower,w_upper))
+    fun=lambda w:-portfolio_utility(w,mu,Sigma,anchor,reg,cfg,floors,lambdas)
+    res=minimize(fun,anchor,method="SLSQP",bounds=bounds,constraints=cons,
+                 options={"maxiter":cfg.solver_maxiter,"ftol":1e-10,"disp":False})
+    w=res.x if res.success and np.all(np.isfinite(res.x)) else anchor
+    return np.asarray(w,float),{"status":("optimal" if res.success else f"fallback:{res.message}"),"projection":status,
+                                "objective":-float(fun(w)),"metrics":reg.metrics(w),"slacks":feasible_slacks(w,reg,cfg,floors,w_lower,w_upper)}
+
+
+def solve_incremental_allocation(w_prev: np.ndarray,growth_q: float,mu: np.ndarray,Sigma: np.ndarray,
+                                 reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
+                                 w_lower: np.ndarray,w_upper: np.ndarray,lambdas: tuple[float,float,float]|None=None) -> tuple[np.ndarray,np.ndarray,dict[str,Any]]:
+    """Solve new-asset mix x; inherited stock remains in place. Returns (w_new, x_increment, diag)."""
+    # Share of current end-period assets represented by current-period net new assets.
+    growth=max(float(growth_q),0.0); a=min(max(growth/(1+growth),1e-4),0.25)
+    target=reg.target_sum
+    x0=project_simplex(np.maximum(w_prev,0),target)
+    xb=[(0.0,target) for _ in BUCKETS]
+    def w_from_x(x): return (1-a)*w_prev+a*np.asarray(x,float)
+    cons=[{"type":"eq","fun":lambda x:np.sum(x)-target}]
+    # hard constraints on resulting stock weights + governance bounds
+    cons.extend([
+        {"type":"ineq","fun":lambda x:reg.metrics(w_from_x(x))["CAR"]-floors["CAR"]},
+        {"type":"ineq","fun":lambda x:reg.metrics(w_from_x(x))["LCR"]-floors["LCR"]},
+        {"type":"ineq","fun":lambda x:reg.metrics(w_from_x(x))["NSFR"]-floors["NSFR"]},
+        {"type":"ineq","fun":lambda x:cfg.duration_cap-reg.metrics(w_from_x(x))["duration"]},
+        {"type":"ineq","fun":lambda x:cfg.trading_cap-w_from_x(x)[3]},
+    ])
+    for i in range(len(BUCKETS)):
+        cons.append({"type":"ineq","fun":lambda x,i=i:w_from_x(x)[i]-w_lower[i]})
+        cons.append({"type":"ineq","fun":lambda x,i=i:w_upper[i]-w_from_x(x)[i]})
+    fun=lambda x:-portfolio_utility(w_from_x(x),mu,Sigma,w_prev,reg,cfg,floors,lambdas)
+    res=minimize(fun,x0,method="SLSQP",bounds=xb,constraints=cons,
+                 options={"maxiter":cfg.solver_maxiter,"ftol":1e-10,"disp":False})
+    if res.success and np.all(np.isfinite(res.x)):
+        x=np.asarray(res.x,float); w=w_from_x(x); status="optimal"
+    else:
+        # fall back to direct feasible weight optimisation, then invert stock-increment equation when possible.
+        w,dd=solve_weight_utility(w_prev,mu,Sigma,reg,cfg,floors,w_lower,w_upper,lambdas)
+        x=(w-(1-a)*w_prev)/a; x=project_simplex(np.maximum(x,0),target); w=w_from_x(x)
+        status=f"fallback_direct:{getattr(res,'message','')};{dd['status']}"
+    diag={"status":status,"growth_share":a,"objective":portfolio_utility(w,mu,Sigma,w_prev,reg,cfg,floors,lambdas),
+          "metrics":reg.metrics(w),"slacks":feasible_slacks(w,reg,cfg,floors,w_lower,w_upper)}
+    return w,x,diag
+
+
+def solve_mpc_incremental(w_prev: np.ndarray,growth_forecast: Sequence[float],mu_forecast: Sequence[np.ndarray],
+                          Sigma: np.ndarray,reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
+                          w_lower: np.ndarray,w_upper: np.ndarray,lambdas: tuple[float,float,float]|None=None) -> tuple[np.ndarray,np.ndarray,dict[str,Any]]:
+    H=min(cfg.mpc_horizon,len(growth_forecast),len(mu_forecast)); n=len(BUCKETS); target=reg.target_sum
+    if H<=1: return solve_incremental_allocation(w_prev,growth_forecast[0],mu_forecast[0],Sigma,reg,cfg,floors,w_lower,w_upper,lambdas)
+    z0=np.tile(project_simplex(np.maximum(w_prev,0),target),H)
+    bounds=[(0,target)]*(H*n)
+    def simulate(z):
+        w=w_prev.copy(); ws=[]; xs=[]
+        for k in range(H):
+            x=z[k*n:(k+1)*n]; g=max(float(growth_forecast[k]),0); a=min(max(g/(1+g),1e-4),0.25)
+            w=(1-a)*w+a*x; ws.append(w.copy()); xs.append(x.copy())
+        return ws,xs
+    cons=[]
+    for k in range(H):
+        cons.append({"type":"eq","fun":lambda z,k=k:np.sum(z[k*n:(k+1)*n])-target})
+        for i in range(n):
+            cons.append({"type":"ineq","fun":lambda z,k=k,i=i:simulate(z)[0][k][i]-w_lower[i]})
+            cons.append({"type":"ineq","fun":lambda z,k=k,i=i:w_upper[i]-simulate(z)[0][k][i]})
+        cons += [
+            {"type":"ineq","fun":lambda z,k=k:reg.metrics(simulate(z)[0][k])["CAR"]-floors["CAR"]},
+            {"type":"ineq","fun":lambda z,k=k:reg.metrics(simulate(z)[0][k])["LCR"]-floors["LCR"]},
+            {"type":"ineq","fun":lambda z,k=k:reg.metrics(simulate(z)[0][k])["NSFR"]-floors["NSFR"]},
+            {"type":"ineq","fun":lambda z,k=k:cfg.duration_cap-reg.metrics(simulate(z)[0][k])["duration"]},
+            {"type":"ineq","fun":lambda z,k=k:cfg.trading_cap-simulate(z)[0][k][3]},
+        ]
+    def obj(z):
+        ws,_=simulate(z); val=0.0; prev=w_prev
+        for k,w in enumerate(ws):
+            val+=(cfg.discount**k)*portfolio_utility(w,mu_forecast[k],Sigma,prev,reg,cfg,floors,lambdas); prev=w
+        return -val
+    res=minimize(obj,z0,method="SLSQP",bounds=bounds,constraints=cons,
+                 options={"maxiter":cfg.solver_maxiter,"ftol":1e-9,"disp":False})
+    if not res.success:
+        return solve_incremental_allocation(w_prev,growth_forecast[0],mu_forecast[0],Sigma,reg,cfg,floors,w_lower,w_upper,lambdas)
+    ws,xs=simulate(res.x)
+    return ws[0],xs[0],{"status":"optimal_mpc","objective":-float(res.fun),"metrics":reg.metrics(ws[0]),
+                        "slacks":feasible_slacks(ws[0],reg,cfg,floors,w_lower,w_upper),"growth_share":max(float(growth_forecast[0]),0)/(1+max(float(growth_forecast[0]),0))}
+
+
+def compute_bandwidth(w_anchor: np.ndarray,reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
+                      w_lower: np.ndarray,w_upper: np.ndarray) -> pd.DataFrame:
+    anchor,_=project_to_feasible(w_anchor,reg,cfg,floors,w_lower,w_upper)
+    cons=allocation_constraints(reg,cfg,floors,w_lower,w_upper); bounds=list(zip(w_lower,w_upper)); rows=[]
+    for i,b in enumerate(BUCKETS):
+        def fmin(w): return w[i]+cfg.bandwidth_rho*np.sum((w-anchor)**2)
+        def fmax(w): return -w[i]+cfg.bandwidth_rho*np.sum((w-anchor)**2)
+        lo=minimize(fmin,anchor,method="SLSQP",bounds=bounds,constraints=cons,options={"maxiter":cfg.solver_maxiter,"ftol":1e-10})
+        hi=minimize(fmax,anchor,method="SLSQP",bounds=bounds,constraints=cons,options={"maxiter":cfg.solver_maxiter,"ftol":1e-10})
+        lv=float(lo.x[i]) if lo.success else float(anchor[i]); hv=float(hi.x[i]) if hi.success else float(anchor[i])
+        rows.append({"bucket":b,"bucket_cn":BUCKET_CN[b],"anchor":float(anchor[i]),"lower":lv,"upper":hv,"width":max(0,hv-lv),
+                     "lower_status":bool(lo.success),"upper_status":bool(hi.success)})
+    return pd.DataFrame(rows)
+
+
+def approximate_shadow_prices(w_star: np.ndarray,mu: np.ndarray,Sigma: np.ndarray,w_prev: np.ndarray,
+                              reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float]) -> dict[str,float]:
+    """Approximate KKT multipliers for regulatory constraints by local stationarity least squares."""
+    util=lambda w:portfolio_utility(w,mu,Sigma,w_prev,reg,cfg,floors)
+    gradU=numerical_gradient(util,w_star,1e-5)
+    names=["CAR","LCR","NSFR"]
+    cols=[]; active=[]
+    for name in names:
+        def gfun(w,name=name): return floors[name]-reg.metrics(w)[name]
+        slack=reg.metrics(w_star)[name]-floors[name]
+        # include constraints that are relatively close; far constraints have zero multiplier.
+        scale={"CAR":1.0,"LCR":10.0,"NSFR":3.0}[name]
+        if slack <= scale:
+            cols.append(numerical_gradient(gfun,w_star,1e-5)); active.append(name)
+    result={f"mu_{n}":0.0 for n in names}
+    if not cols: return result
+    # grad U = J_g^T mu + 1*nu; mu>=0, nu free
+    M=np.column_stack(cols+[np.ones(len(w_star))])
+    lb=np.r_[np.zeros(len(cols)),-np.inf]; ub=np.r_[np.full(len(cols),np.inf),np.inf]
+    fit=lsq_linear(M,gradU,bounds=(lb,ub))
+    for j,n in enumerate(active): result[f"mu_{n}"]=float(max(fit.x[j],0))
+    result["stationarity_resid"]=float(np.linalg.norm(M@fit.x-gradU))
+    return result
+
+
+def boundary_step(w_anchor: np.ndarray,direction: np.ndarray,reg: RegulatoryMap,cfg: AllocationConfig,
+                  floors: dict[str,float],w_lower: np.ndarray,w_upper: np.ndarray) -> tuple[float,list[str]]:
+    d=np.asarray(direction,float)
+    norm=np.linalg.norm(d)
+    if norm<1e-12: return 0.0,[]
+    d=d/norm
+    def ok(eta): return is_feasible(w_anchor+eta*d,reg,cfg,floors,w_lower,w_upper,1e-7)
+    lo,hi=0.0,0.05
+    while hi<5.0 and ok(hi): lo=hi; hi*=2
+    for _ in range(50):
+        mid=(lo+hi)/2
+        if ok(mid): lo=mid
+        else: hi=mid
+    w=w_anchor+lo*d; s=feasible_slacks(w,reg,cfg,floors,w_lower,w_upper)
+    bind=[]
+    tol={"CAR":1e-3,"LCR":1e-2,"NSFR":1e-2,"duration":1e-3,"trading":1e-4,"lower_min":1e-4,"upper_min":1e-4}
+    for k in tol:
+        if s[k]<=tol[k]: bind.append(k)
+    return float(lo),bind
+
+
+class GovernanceSafeQLearner:
+    """Tiny tabular Q-learner. Actions only select penalty multipliers; never asset weights."""
+    def __init__(self,base_lambdas: tuple[float,float,float],seed: int=0):
+        self.base=np.asarray(base_lambdas,float); self.rng=np.random.default_rng(seed)
+        self.actions=np.array([
+            [0.7,0.8,0.8],[1.0,1.0,1.0],[1.3,1.0,1.0],[1.0,1.3,1.0],[1.0,1.0,1.3],
+            [1.3,1.3,1.0],[1.3,1.0,1.3],[1.0,1.3,1.3],[1.4,1.4,1.4]
+        ])
+        self.Q={}
+    def state(self,p_hard:float,slacks:dict[str,float]) -> tuple[int,int,int,int]:
+        r=2 if p_hard>0.6 else (1 if p_hard>0.3 else 0)
+        return (r,int(slacks.get("CAR",9)<0.5),int(slacks.get("LCR",99)<10),int(slacks.get("NSFR",99)<3))
+    def choose(self,s,eps=0.1):
+        q=self.Q.setdefault(s,np.zeros(len(self.actions)))
+        if self.rng.random()<eps:return int(self.rng.integers(len(self.actions)))
+        return int(np.argmax(q))
+    def lambdas(self,a:int)->tuple[float,float,float]:
+        return tuple((self.base*self.actions[a]).tolist())
+    def update(self,s,a,reward,s2,alpha=0.15,gamma=0.90):
+        q=self.Q.setdefault(s,np.zeros(len(self.actions))); q2=self.Q.setdefault(s2,np.zeros(len(self.actions)))
+        q[a]+=alpha*(reward+gamma*np.max(q2)-q[a])
+
+
+def train_penalty_qlearner(panel: pd.DataFrame,params: pd.DataFrame,yields: pd.DataFrame,gamma: np.ndarray,state_map: dict[int,str],
+                           cfg: AllocationConfig,episodes:int=4) -> GovernanceSafeQLearner:
+    learner=GovernanceSafeQLearner((cfg.lambda_var,cfg.lambda_cap,cfg.lambda_liq),cfg.seed)
+    pp=params.set_index("bucket").loc[BUCKETS]
+    base_vol=np.array([0.10,0.06,0.03,0.12,0.02,0.09])/100
+    Sigma=0.75*np.diag(base_vol**2)+0.25*np.outer(base_vol,base_vol)
+    lo=np.asarray(cfg.w_lower,float); hi=np.asarray(cfg.w_upper,float)
+    hard_idx=[k for k,v in state_map.items() if v=="hardening"]
+    for ep in range(episodes):
+        w=panel[[f"w_{b}" for b in BUCKETS]].iloc[0].to_numpy(float)
+        for t in range(len(panel)-1):
+            row=panel.iloc[t]; w_obs=row[[f"w_{b}" for b in BUCKETS]].to_numpy(float); reg=RegulatoryMap.calibrate(row,w_obs,params,target_sum=float(np.sum(w))); floors={"CAR":cfg.car_min,"LCR":cfg.lcr_min,"NSFR":cfg.nsfr_min}
+            sl=feasible_slacks(w,reg,cfg,floors,lo,hi); ph=float(gamma[t,hard_idx].sum()) if hard_idx else 0.0
+            s=learner.state(ph,sl); a=learner.choose(s,eps=max(0.05,0.25*(1-ep/max(episodes,1))))
+            lam=learner.lambdas(a)
+            mu=(yields.iloc[t].to_numpy(float)-float(row["rL_avg_interest_bearing_cost_pct"]))/100
+            wn,_,diag=solve_incremental_allocation(w,float(row["g_asset_growth_q"]),mu,Sigma,reg,cfg,floors,lo,hi,lam)
+            violation=sum(max(0,-v) for k,v in diag["slacks"].items() if k in {"CAR","LCR","NSFR","duration","trading"})
+            reward=float(diag["objective"])-50*violation-0.2*np.sum(abs(wn-w))
+            r2=panel.iloc[t+1]; wobs2=r2[[f"w_{b}" for b in BUCKETS]].to_numpy(float); reg2=RegulatoryMap.calibrate(r2,wobs2,params,target_sum=float(np.sum(wn))); sl2=feasible_slacks(wn,reg2,cfg,floors,lo,hi)
+            ph2=float(gamma[t+1,hard_idx].sum()) if hard_idx else 0.0; s2=learner.state(ph2,sl2)
+            learner.update(s,a,reward,s2); w=wn
+    return learner
+
+
+def run_allocation_engine(panel: pd.DataFrame,yc_gov: pd.DataFrame,yc_cred: pd.DataFrame,params: pd.DataFrame,
+                          cfg: AllocationConfig) -> dict[str,Any]:
+    feats,fnames=build_hmm_features(panel,params); scaler=StandardScaler(); Xs=scaler.fit_transform(feats)
+    hmm=init_hmm(Xs,3,cfg.seed); hmm_ll=hmm.em_train(Xs,50,1e-4)
+    gamma,xi,_=hmm.forward_backward(Xs); state_map=map_hmm_regimes(hmm,scaler,fnames)
+    A_bayes=bayes_transition_mean(xi,1.0)
+    hard_idx=[k for k,v in state_map.items() if v=="hardening"]
+    hard_prob=gamma[:,hard_idx].sum(axis=1) if hard_idx else np.zeros(len(panel))
+    bayes=dynamic_bayesian_nim_regression(panel,hard_prob) if cfg.use_bayes else None
+    qforecast=quantile_forecast_latest(panel,yc_gov,gamma,(cfg.q_delta,0.5,1-cfg.q_delta),cfg.seed) if cfg.use_quantile else {}
+    yields=derive_bucket_yields(panel,yc_gov,yc_cred)
+
+    # rolling covariance from reconstructed bucket yields; fallback covariance is always PSD.
+    Yret=yields.to_numpy(float)/100
+    cov=np.cov(np.diff(Yret,axis=0).T) if len(Yret)>8 else np.diag(np.full(6,1e-4))
+    cov=np.nan_to_num(cov,nan=0.0,posinf=0.0,neginf=0.0)+(1e-8*np.eye(6))
+    eig=np.linalg.eigvalsh(cov)
+    if eig.min()<1e-10: cov+=np.eye(6)*(1e-10-eig.min())
+    lo=np.asarray(cfg.w_lower,float); hi=np.asarray(cfg.w_upper,float)
+
+    learner=None
+    if cfg.use_rl:
+        learner=train_penalty_qlearner(panel,params,yields,gamma,state_map,cfg,episodes=4)
+
+    rows=[]; w=panel[[f"w_{b}" for b in BUCKETS]].iloc[0].to_numpy(float)
+    for t in range(len(panel)):
+        row=panel.iloc[t]
+        w_obs=row[[f"w_{b}" for b in BUCKETS]].to_numpy(float)
+        reg=RegulatoryMap.calibrate(row,w_obs,params,target_sum=float(np.sum(w)))
+        qf=qforecast if t==len(panel)-1 else None
+        floors=effective_constraint_floors(row,cfg,qf)
+        # If chance buffer makes current state infeasible beyond repair, revert to statutory/management hard floors.
+        test_anchor,_=project_to_feasible(w,reg,cfg,floors,lo,hi)
+        if not is_feasible(test_anchor,reg,cfg,floors,lo,hi,1e-3):
+            floors={"CAR":cfg.car_min,"LCR":cfg.lcr_min,"NSFR":cfg.nsfr_min}
+        # expected net return by bucket, with a small haircut-loss adjustment linked to market volatility.
+        mu=(yields.iloc[t].to_numpy(float)-float(row["rL_avg_interest_bearing_cost_pct"]))/100
+        hc=params.set_index("bucket").loc[BUCKETS,"haircut"].to_numpy(float)
+        vol=float(np.std(np.diff(yc_gov[yc_gov["maturity_year"]==10]["yld_pct"].to_numpy(float)[:max(t+1,2)]))) if t>1 else 0.0
+        mu=mu-hc*max(vol,0)/100
+
+        lambdas=(cfg.lambda_var,cfg.lambda_cap,cfg.lambda_liq)
+        if learner is not None:
+            s=learner.state(float(hard_prob[t]),feasible_slacks(w,reg,cfg,floors,lo,hi)); a=learner.choose(s,eps=0.0); lambdas=learner.lambdas(a)
+        if cfg.use_mpc and t<len(panel)-1:
+            H=min(cfg.mpc_horizon,len(panel)-t)
+            growth=panel["g_asset_growth_q"].iloc[t:t+H].to_numpy(float)
+            mus=[]
+            for kk in range(H):
+                rr=panel.iloc[t+kk]; mus.append((yields.iloc[t+kk].to_numpy(float)-float(rr["rL_avg_interest_bearing_cost_pct"]))/100)
+            wn,xinc,diag=solve_mpc_incremental(w,growth,mus,cov,reg,cfg,floors,lo,hi,lambdas)
+        else:
+            wn,xinc,diag=solve_incremental_allocation(w,float(row["g_asset_growth_q"]),mu,cov,reg,cfg,floors,lo,hi,lambdas)
+        pcont=pexp=phard=0.0
+        for k in range(3):
+            lab=state_map[k]
+            if lab=="controllable":pcont+=gamma[t,k]
+            elif lab=="explicit":pexp+=gamma[t,k]
+            else:phard+=gamma[t,k]
+        rec={"period":row["period"],"p_controllable":pcont,"p_explicit":pexp,"p_hardening":phard,
+             "regime":max([(pcont,"controllable"),(pexp,"explicit"),(phard,"hardening")])[1],
+             "lambda_var_tuned":lambdas[0],"lambda_cap_tuned":lambdas[1],"lambda_liq_tuned":lambdas[2],
+             "solver_status":diag["status"],"objective":diag["objective"],"growth_share":diag.get("growth_share",np.nan),
+             "CAR_floor":floors["CAR"],"LCR_floor":floors["LCR"],"NSFR_floor":floors["NSFR"]}
+        for i,b in enumerate(BUCKETS): rec[f"w_mpc_{b}"]=float(wn[i]); rec[f"inc_{b}"]=float(xinc[i]); rec[f"mu_{b}"]=float(mu[i])
+        for k,v in diag["metrics"].items():rec[f"metric_{k}"]=float(v)
+        for k,v in diag["slacks"].items():rec[f"slack_{k}"]=float(v)
+        rows.append(rec); w=wn
+    hist=pd.DataFrame(rows)
+
+    # Latest-period deliverable diagnostics: bandwidth, local boundary, shadow prices.
+    t=len(panel)-1; row=panel.iloc[t]; wstar=hist[[f"w_mpc_{b}" for b in BUCKETS]].iloc[-1].to_numpy(float)
+    wprev=hist[[f"w_mpc_{b}" for b in BUCKETS]].iloc[-2].to_numpy(float) if len(hist)>1 else wstar.copy()
+    w_obs=row[[f"w_{b}" for b in BUCKETS]].to_numpy(float); reg=RegulatoryMap.calibrate(row,w_obs,params,target_sum=float(np.sum(wstar))); floors={"CAR":float(hist.iloc[-1]["CAR_floor"]),"LCR":float(hist.iloc[-1]["LCR_floor"]),"NSFR":float(hist.iloc[-1]["NSFR_floor"])}
+    bandwidth=compute_bandwidth(wstar,reg,cfg,floors,lo,hi)
+    mu_latest=hist[[f"mu_{b}" for b in BUCKETS]].iloc[-1].to_numpy(float)
+    shadows=approximate_shadow_prices(wstar,mu_latest,cov,wprev,reg,cfg,floors)
+    eta,bindings=boundary_step(wstar,wstar-wprev,reg,cfg,floors,lo,hi)
+    latest_diag={"eta_max":eta,"binding_report":bindings,"shadow_prices":shadows,"metrics":reg.metrics(wstar),
+                 "slacks":feasible_slacks(wstar,reg,cfg,floors,lo,hi),"feasible":is_feasible(wstar,reg,cfg,floors,lo,hi,1e-3)}
+    return {"history":hist,"bandwidth":bandwidth,"latest_diagnostics":latest_diag,"hmm":hmm,"gamma":gamma,
+            "state_map":state_map,"hmm_loglik":hmm_ll,"bayes_transition":A_bayes,"bayes_nim":bayes,
+            "quantile_forecast":qforecast,"bucket_yields":yields,"penalty_learner":learner}
+
+# ============================================================
+# A7 External rate-stage recognition + internal NIM calibration
+# ============================================================
+
+def _nearest_stage(v: float, centres: Sequence[float]) -> int:
+    c=np.asarray(centres,float)
+    return int(np.argmin(np.abs(c-float(v))))
+
+
+def _persistence_filter(raw: Sequence[int], k: int) -> np.ndarray:
+    raw=np.asarray(raw,int); out=raw.copy()
+    if len(raw)==0:return out
+    out[0]=raw[0]; candidate=raw[0]; count=0
+    current=raw[0]
+    for t in range(1,len(raw)):
+        if raw[t]==current:
+            candidate=current; count=0; out[t]=current
+        else:
+            if raw[t]==candidate: count+=1
+            else: candidate=raw[t]; count=1
+            if count>=max(k,1): current=candidate; count=0
+            out[t]=current
+    return out
+
+
+def _nim_state_index(nim: float, thresholds: tuple[float,float,float]) -> int:
+    a,b,c=thresholds
+    if nim>a:return 0
+    if nim>b:return 1
+    if nim>c:return 2
+    return 3
+
+
+def recognize_rate_stage(panel: pd.DataFrame,yc_gov: pd.DataFrame,cfg: StageConfig) -> pd.DataFrame:
+    y10=(yc_gov[yc_gov["maturity_year"]==10][["period","yld_pct"]]
+         .drop_duplicates("period").set_index("period")["yld_pct"])
+    df=panel[["period","LPR1_pct","DR007_pct","NIM_state_pct"]].copy()
+    df["Y10_pct"]=df["period"].astype(str).map(y10).astype(float)
+    raw=[]; lpr_s=[]; dr_s=[]; y10_s=[]
+    w=np.asarray(cfg.weights,float); w=w/w.sum()
+    for _,r in df.iterrows():
+        sl=_nearest_stage(r["LPR1_pct"],cfg.lpr_centres); sd=_nearest_stage(r["DR007_pct"],cfg.dr_centres); sy=_nearest_stage(r["Y10_pct"],cfg.y10_centres)
+        score=w[0]*sl+w[1]*sd+w[2]*sy
+        raw.append(int(np.clip(np.rint(score),0,len(cfg.lpr_centres)-1))); lpr_s.append(sl); dr_s.append(sd); y10_s.append(sy)
+    filt=_persistence_filter(raw,cfg.persist_k)
+    nim_state=np.array([_nim_state_index(x,cfg.nim_thresholds) for x in df["NIM_state_pct"]])
+    expected=np.clip(filt-1,0,3)
+    divergence=nim_state-expected
+    internal=np.where(divergence>cfg.divergence_tolerance,"PressureAhead",
+                      np.where(divergence < -cfg.divergence_tolerance,"BufferAvailable","Matched"))
+    # 3-phase labels used by A2/A4, based on the primary LPR anchor.
+    lpr=df["LPR1_pct"].to_numpy(float)
+    phase=np.where(lpr>=2.75,"Enter",np.where(lpr>=1.75,"Visible","Deep"))
+    dr=df["DR007_pct"].to_numpy(float); yv=df["Y10_pct"].to_numpy(float)
+    drvol=pd.Series(dr).rolling(4,min_periods=3).std().to_numpy(); yvol=pd.Series(yv).rolling(4,min_periods=3).std().to_numpy()
+    scenarios=[]
+    for t in range(len(df)):
+        sc="Stable"
+        if t>=2 and lpr[t]<lpr[t-1]<lpr[t-2] and yv[t]<yv[t-1]: sc="Downward"
+        if t>=4:
+            prev_dr=np.nanmean(drvol[max(0,t-4):t]); prev_y=np.nanmean(yvol[max(0,t-4):t])
+            if (np.isfinite(drvol[t]) and drvol[t]>1.25*prev_dr) or (np.isfinite(yvol[t]) and yvol[t]>1.25*prev_y): sc="Volatility"
+        if t>0 and filt[t]>filt[t-1] and nim_state[t]>nim_state[t-1]: sc="PressureSwitch"
+        scenarios.append(sc)
+    # Persistence confirmation for a non-stable scenario.
+    switch=[]
+    for t,sc in enumerate(scenarios):
+        if sc=="Stable": switch.append(False); continue
+        lo=max(0,t-cfg.persist_k+1); switch.append(all(x==sc for x in scenarios[lo:t+1]) and t-lo+1>=cfg.persist_k)
+    labels=["4pct_or_above","3pct","2pct","1pct","0pct","negative"]
+    out=df.copy()
+    out["Stage_LPR"]=lpr_s; out["Stage_DR007"]=dr_s; out["Stage_Y10"]=y10_s; out["RateStageIndexRaw"]=raw; out["RateStageIndex"]=filt
+    out["RateStage"]=[labels[min(i,len(labels)-1)] for i in filt]; out["LowRatePhase"]=phase
+    out["NIMStateIndex"]=nim_state; out["ExpectedNIMStateIndex"]=expected; out["Divergence"]=divergence; out["InternalFlag"]=internal
+    out["Scenario"]=scenarios; out["SwitchFlag"]=switch; out["DR007Vol4Q"]=drvol; out["Y10Vol4Q"]=yvol
+    return out
+
+
+# ============================================================
+# A8 RORAC / RORWA / capital-efficiency diagnostics
+# ============================================================
+
+def risk_adjusted_diagnostics(panel: pd.DataFrame,params: pd.DataFrame,yields: pd.DataFrame,
+                              allocation_history: pd.DataFrame|None=None,econ_capital_ratio: float=0.105) -> pd.DataFrame:
+    row=panel.iloc[-1]; A=float(row["A_total_assets_rmb_bn"]); rL=float(row["rL_avg_interest_bearing_cost_pct"])/100
+    pp=params.set_index("bucket").loc[BUCKETS]
+    if allocation_history is not None and len(allocation_history):
+        w=np.array([float(allocation_history.iloc[-1][f"w_mpc_{b}"]) for b in BUCKETS])
+    else:w=row[[f"w_{b}" for b in BUCKETS]].to_numpy(float)
+    yld=yields.iloc[-1].to_numpy(float)/100
+    total_op=max(float(row.get("operating_cost_proxy_rmb_bn",0.0)),0.0)
+    # Customer-value proxy uses non-interest income allocated by business affinity; marked Estimated.
+    nonint=max(float(row.get("non_interest_income_proxy_rmb_bn",0.0)),0.0)
+    customer_affinity=np.array([0.8,0.4,0.3,0.8,0.2,1.0])
+    customer=nonint*customer_affinity/customer_affinity.sum()
+    rows=[]
+    for i,b in enumerate(BUCKETS):
+        exposure=A*w[i]; income=exposure*yld[i]; funding=exposure*rL
+        op=total_op*(exposure/max(A,1e-12))
+        # In absence of disclosed bucket EL, use a transparent haircut-linked conservative proxy.
+        el_rate=float(pp.iloc[i]["haircut"])*0.05
+        el=exposure*el_rate
+        rwa=exposure*float(pp.iloc[i]["omega_rwa_density"])
+        net=income-funding-op-el
+        # A zero regulatory risk weight does not imply infinite economic return efficiency.
+        # Leave RORWA/RORAC undefined unless a positive capital denominator is available.
+        econ=rwa*econ_capital_ratio if rwa>1e-8 else np.nan
+        rorwa=net/rwa if rwa>1e-8 else np.nan
+        rorac=net/econ if np.isfinite(econ) and econ>1e-8 else np.nan
+        rows.append({"bucket":b,"bucket_cn":BUCKET_CN[b],"Exposure":exposure,"Income":income,"FundingCost":funding,"OpCost":op,"EL":el,
+                     "RWA":rwa,"EconCapital":econ,"NetRAR":net,"RORWA":rorwa,"RORAC":rorac,
+                     "CapitalIntensity":rwa/max(exposure,1e-8),"LiquidityValue":float(pp.iloc[i]["hqla_ratio"])-float(pp.iloc[i]["rsf"]),
+                     "CustomerValue":customer[i],"Duration":float(pp.iloc[i]["duration_year"]),"DataFlag":"Estimated"})
+    out=pd.DataFrame(rows)
+    # Portfolio-weighted reference values.
+    expw=out["Exposure"]/max(out["Exposure"].sum(),1e-12)
+    refs={}
+    for c in ["RORWA","RORAC","CapitalIntensity"]:
+        finite=np.isfinite(out[c].to_numpy(float))
+        refs[c]=float(np.sum(expw[finite]*out.loc[finite,c])/max(expw[finite].sum(),1e-12)) if np.any(finite) else np.nan
+        ref=refs[c]
+        out[c+"Index"]=100*out[c]/ref if np.isfinite(ref) and ref>0 else np.nan
+    def pct_rank(s,ascending=True):
+        rr=s.rank(pct=True,ascending=ascending)*100
+        return rr.fillna(50.0)
+    out["DirectionIndex"]=(0.35*pct_rank(out["RORAC"],True)+0.30*pct_rank(out["RORWA"],True)+
+                           0.20*pct_rank(out["CapitalIntensity"],False)+0.10*pct_rank(out["LiquidityValue"],True)+0.05*pct_rank(out["CustomerValue"],True))
+    med_rorac=out["RORAC"].median(skipna=True); med_rorwa=out["RORWA"].median(skipna=True); med_cap=out["CapitalIntensity"].median(); cap_q75=out["CapitalIntensity"].quantile(0.75)
+    actions=[]
+    for _,r in out.iterrows():
+        if r["NetRAR"]>0 and np.isfinite(r["RORAC"]) and np.isfinite(r["RORWA"]) and r["RORAC"]>=med_rorac and r["RORWA"]>=med_rorwa and r["CapitalIntensity"]<=cap_q75: actions.append("IncreaseOrMaintain")
+        elif r["NetRAR"]>0 and (r["CapitalIntensity"]>med_cap or r["LiquidityValue"]<0): actions.append("RepriceOrRestructure")
+        else: actions.append("ReduceOrExit")
+    out["Action"]=actions
+    return out.sort_values("DirectionIndex",ascending=False).reset_index(drop=True)
+
+
+# ============================================================
+# A9 Stock pools + five admission gates
+# ============================================================
+
+def stock_and_new_asset_gates(a8: pd.DataFrame,params: pd.DataFrame,watch_history: dict[str,int]|None=None) -> pd.DataFrame:
+    hist=watch_history or {}; pp=params.set_index("bucket").loc[BUCKETS]
+    med_rorac=float(a8["RORAC"].median()); med_rorwa=float(a8["RORWA"].median()); med_dir=float(a8["DirectionIndex"].median())
+    rows=[]
+    for _,r in a8.iterrows():
+        b=r["bucket"]; p=pp.loc[b]
+        cash_stable=(b not in {"trading"}); return_ok=r["NetRAR"]>0; risk_control=float(p["haircut"])<0.10
+        customer_strong=r["CustomerValue"]>=a8["CustomerValue"].median(); repair=(r["NetRAR"]>-abs(a8["NetRAR"].median()) and risk_control)
+        nsfr_high=float(p["rsf"])>0.65; migration_rising=float(p["haircut"])>=0.10
+        if cash_stable and return_ok and risk_control and customer_strong: pool="StableHold"
+        elif repair: pool="RevalueOptimize"
+        elif (not return_ok) or nsfr_high or migration_rising: pool="ReduceReplace"
+        else: pool="ExitDispose"
+        if r["DirectionIndex"]>=med_dir and r["Action"]=="IncreaseOrMaintain": tier="Priority"
+        elif r["NetRAR"]>0 and risk_control: tier="Watch"
+        else:tier="ReduceExit"
+        if tier=="Watch" and hist.get(b,0)>=2:tier="ReduceExit"
+        if tier=="ReduceExit" and r["RORAC"]>=med_rorac and r["RORWA"]>=med_rorwa and customer_strong:tier="Watch"
+        gates={
+            "Gate1_Return":bool(return_ok),
+            "Gate2_Capital":bool(r["RORAC"]>=med_rorac*0.8 and r["RORWA"]>=med_rorwa*0.8),
+            "Gate3_Liquidity":bool(float(p["rsf"])<=0.70 and float(p["duration_year"])<=5.0),
+            "Gate4_Risk":bool(float(p["haircut"])<=0.12),
+            "Gate5_Customer":bool(r["CustomerValue"]>=0.5*a8["CustomerValue"].median()),
+        }
+        if all(gates.values()): action="ApproveAndAllocate"
+        elif not gates["Gate1_Return"]: action="RepriceOrReduceLimit"
+        elif not gates["Gate2_Capital"]: action="ShiftToCapitalEfficientAsset"
+        elif not gates["Gate3_Liquidity"]: action="ShortenMaturityOrAddStableFunding"
+        elif not gates["Gate4_Risk"]: action="WatchLimitOrReject"
+        else: action="AdjustServicePackageOrLowerPriority"
+        rows.append({"bucket":b,"bucket_cn":BUCKET_CN[b],"StockPool":pool,"TierList":tier,**gates,"Action":action})
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# A10 Backtest, triggers and rolling correction
+# ============================================================
+
+def _eval_trigger(value: float,prev: float|None,rule: dict[str,Any]) -> bool:
+    typ=rule.get("type"); thr=float(rule.get("value",0))
+    if not np.isfinite(value): return False
+    if typ=="min":return value<thr
+    if typ=="max":return value>thr
+    if prev is None or not np.isfinite(prev):return False
+    change=value-prev
+    if typ=="abs_change_ge":return abs(change)>=thr
+    if typ=="change_le":return change<=thr
+    if typ=="change_ge":return change>=thr
+    return False
+
+
+def evaluate_trigger_group(signals: dict[str,float],prev_signals: dict[str,float]|None,rules: dict[str,dict[str,Any]]) -> dict[str,bool]:
+    prev_signals=prev_signals or {}
+    return {name:_eval_trigger(float(signals.get(name,np.nan)),float(prev_signals.get(name,np.nan)) if name in prev_signals else None,rule)
+            for name,rule in rules.items()}
+
+
+def aggregate_severity(*flags: dict[str,bool]) -> str:
+    n=sum(sum(bool(v) for v in f.values()) for f in flags); total=sum(len(f) for f in flags)
+    if n==0:return "正常"
+    if n==1:return "关注"
+    if n<=max(2,total//3):return "预警"
+    return "压力"
+
+
+def run_backtest_and_triggers(panel: pd.DataFrame,allocation: pd.DataFrame,stage: pd.DataFrame,params: pd.DataFrame,
+                              trigger_set: dict[str,dict[str,dict[str,Any]]]) -> dict[str,Any]:
+    pp=params.set_index("bucket").loc[BUCKETS]
+    omega=pp["omega_rwa_density"].to_numpy(float); hqla=pp["hqla_ratio"].to_numpy(float); rsf=pp["rsf"].to_numpy(float)
+    rows=[]; trig_rows=[]; prev_ext=prev_op=prev_con=None
+    for t in range(len(panel)):
+        r=panel.iloc[t]; wplan=allocation[[f"w_mpc_{b}" for b in BUCKETS]].iloc[t].to_numpy(float); wact=r[[f"w_{b}" for b in BUCKETS]].to_numpy(float)
+        A=float(r["A_total_assets_rmb_bn"])
+        plan_metrics={"Return":float(np.mean([allocation.iloc[t][f"mu_{b}"] for b in BUCKETS])),
+                      "Capital":float(omega@wplan),"Liquidity":float(hqla@wplan),"StableFunding":float(rsf@wplan),
+                      "Risk":float(pp["haircut"].to_numpy(float)@wplan),"Valuation":float(pp["duration_year"].to_numpy(float)@wplan),
+                      "Collaboration":float(wplan[5]),"CustomerValue":float(wplan[0]+wplan[5])}
+        act_metrics={"Return":float(r["NIM_state_pct"])/100,"Capital":float(omega@wact),"Liquidity":float(hqla@wact),"StableFunding":float(rsf@wact),
+                     "Risk":float(pp["haircut"].to_numpy(float)@wact),"Valuation":float(pp["duration_year"].to_numpy(float)@wact),
+                     "Collaboration":float(wact[5]),"CustomerValue":float(wact[0]+wact[5])}
+        # Attribution is rule-based and auditable, not a causal decomposition claim.
+        rate_change=float(r["LPR1_pct"]-panel.iloc[t-1]["LPR1_pct"]) if t else 0.0
+        cap_tight=float(r["CAR_pct"]-panel.iloc[t-1]["CAR_pct"]) if t else 0.0
+        liq_tight=float(r["NSFR_pct"]-panel.iloc[t-1]["NSFR_pct"]) if t else 0.0
+        attr="Execution"
+        if abs(rate_change)>=max(abs(cap_tight)/10,abs(liq_tight)/10):attr="RateChange"
+        elif cap_tight<0:attr="CapitalTightening"
+        elif liq_tight<0:attr="LiquidityTightening"
+        for d in plan_metrics:
+            rows.append({"period":r["period"],"Dimension":d,"Plan":plan_metrics[d],"Actual":act_metrics[d],"Deviation":act_metrics[d]-plan_metrics[d],"Attribution":attr})
+
+        st=stage.iloc[t]
+        ext={"LPR1_change":float(r["LPR1_pct"]),"DR007_change":float(r["DR007_pct"]),"Y10_change":float(st["Y10_pct"])}
+        op={"NIM":float(r["NIM_state_pct"]),"NIM_change":float(r["NIM_state_pct"])}
+        con={"CAR":float(r["CAR_pct"]),"LCR":float(r["LCR_pct"]),"NSFR":float(r["NSFR_pct"])}
+        ef=evaluate_trigger_group(ext,prev_ext,trigger_set.get("External",{})); of=evaluate_trigger_group(op,prev_op,trigger_set.get("Operating",{})); cf=evaluate_trigger_group(con,prev_con,trigger_set.get("Constraint",{}))
+        level=aggregate_severity(ef,of,cf)
+        actions=[]
+        if of.get("NIM",False) or of.get("NIM_change",False):actions.append("压降低效资产，增加稳定票息与服务收入贡献")
+        if cf.get("CAR",False):actions.append("提高RORAC门槛并控制高RWA资产")
+        if cf.get("NSFR",False):actions.append("控制长久期资产并补充稳定资金/HQLA")
+        if ef.get("DR007_change",False) or ef.get("Y10_change",False):actions.append("缩短久期、降低方向性暴露并复核套保")
+        if not actions and level!="正常":actions.append("复核配置带宽、FTP与风险预算")
+        updates=[]
+        if level in {"预警","压力"}:updates=["Update HMM transition/state probabilities","Update Bayesian/Kalman parameters","Recalibrate quantile forecasts","Re-solve MPC","Retune RL penalties within bounds"]
+        trig_rows.append({"period":r["period"],"ExternalFlags":json.dumps(ef,ensure_ascii=False),"OperatingFlags":json.dumps(of,ensure_ascii=False),"ConstraintFlags":json.dumps(cf,ensure_ascii=False),
+                          "TriggerLevel":level,"CorrectionAction":"；".join(actions),"ParameterUpdate":"；".join(updates)})
+        prev_ext,prev_op,prev_con=ext,op,con
+    return {"BacktestTable":pd.DataFrame(rows),"TriggerTable":pd.DataFrame(trig_rows),
+            "LatestTriggerLevel":trig_rows[-1]["TriggerLevel"] if trig_rows else "正常",
+            "LatestCorrectionAction":trig_rows[-1]["CorrectionAction"] if trig_rows else "",
+            "LatestParameterUpdate":trig_rows[-1]["ParameterUpdate"] if trig_rows else ""}
+
+
+# ============================================================
+# End-to-end orchestration + Chinese output layer (main03 evolved)
+# ============================================================
+
+def _load_or_generate(cfg:SystemConfig,force_generate:bool=True) -> tuple[pd.DataFrame,pd.DataFrame,pd.DataFrame,pd.DataFrame]:
+    sim=Path(cfg.sim_dir); required=[sim/"panel_quarterly.csv",sim/"yc_gov_long.csv",sim/"yc_cred_long.csv",sim/"bucket_params.csv"]
+    if force_generate or not all(p.exists() for p in required):
+        simulate_nim_state_data(start=cfg.start,end=cfg.end,seed=cfg.seed,out_dir=cfg.sim_dir,
+                                leave_blank_other_assets=True,blank_share_range=(0.03,0.08),lpr_scenario="stage",
+                                lpr_stage_levels=(3.0,2.5,2.0,1.5),lpr_stage_len=8)
+    return (pd.read_csv(required[0]),pd.read_csv(required[1]),pd.read_csv(required[2]),pd.read_csv(required[3]))
+
+
+def _make_a5_inputs(panel:pd.DataFrame,params:pd.DataFrame) -> tuple[dict[str,float],list[dict[str,Any]],list[dict[str,Any]]]:
+    r=panel.iloc[-1]; A=float(r["A_total_assets_rmb_bn"]); w=r[[f"w_{b}" for b in BUCKETS]].to_numpy(float); pp=params.set_index("bucket").loc[BUCKETS]
+    avgEA=A*max(w.sum(),0.85); nii=float(r["NIM_state_pct"])/100*avgEA; equity=A*0.10; profit=max(nii+float(r.get("non_interest_income_proxy_rmb_bn",0))-float(r.get("provision_proxy_rmb_bn",0))-float(r.get("operating_cost_proxy_rmb_bn",0)),1e-6)
+    bs={"TotalAssets":A,"TotalLiab":A-equity,"Equity":equity,"NII":nii,"NIM":float(r["NIM_state_pct"])/100,"ROA":profit/A,"ROE":profit/equity,
+        "AvgEarningAssets":avgEA,"Profit0":profit,"PayoutRatio":0.30}
+    ba=[]
+    for i,b in enumerate(BUCKETS):
+        dur=float(pp.iloc[i]["duration_year"]); freq=4.0 if b in {"credit","ib"} else max(1.0,1/max(dur,0.25))
+        ba.append({"Name":b,"Balance":A*w[i],"RepriceFreq":freq,"RemainMat":max(dur,0.25),"PrepayRate":0.02 if b=="credit" else 0.0})
+    L=A-equity; cost=float(r["rL_avg_interest_bearing_cost_pct"])/100
+    bl=[
+        {"Name":"deposit","Balance":L*0.72,"RepriceFreq":1.0,"RemainMat":1.0,"PrepayRate":0.0,"CostRate0":cost*0.75,"CostFloor":0.006},
+        {"Name":"market_funding","Balance":L*0.18,"RepriceFreq":4.0,"RemainMat":0.5,"PrepayRate":0.0,"CostRate0":cost*1.15,"CostFloor":0.002},
+        {"Name":"other_liability","Balance":L*0.10,"RepriceFreq":2.0,"RemainMat":1.0,"PrepayRate":0.0,"CostRate0":cost,"CostFloor":0.003},
+    ]
+    return bs,ba,bl
+
+
+def _plot_outputs(outdir:Path,panel:pd.DataFrame,stage:pd.DataFrame,a3:dict[str,Any],a4:pd.DataFrame,a6:dict[str,Any]):
+    if not MATPLOTLIB_OK:return
+    # LPR/NIM trend
+    fig,ax=plt.subplots(figsize=(10,4.5)); x=np.arange(len(panel)); ax.plot(x,panel["LPR1_pct"],label="1Y LPR (%)"); ax.plot(x,panel["NIM_state_pct"],label="NIM (%)"); ax.set_title("1Y LPR and NIM"); ax.set_xlabel("Quarter"); ax.legend(); ax.grid(alpha=.25); fig.tight_layout(); fig.savefig(outdir/"fig_lpr_nim.png",dpi=180); plt.close(fig)
+    # Shadow rate
+    fig,ax=plt.subplots(figsize=(10,4.5)); ax.plot(x,a3["rShadow"],label="Shadow short rate"); ax.plot(x,panel["DR007_pct"],label="DR007"); ax.set_title("Shadow-rate proxy vs DR007"); ax.legend(); ax.grid(alpha=.25); fig.tight_layout(); fig.savefig(outdir/"fig_shadow_rate.png",dpi=180); plt.close(fig)
+    # LP
+    fig,ax=plt.subplots(figsize=(8,4.5))
+    for st,g in a4.groupby("Stage"):
+        ax.plot(g["Horizon"],g["IRF"],marker="o",label=st)
+    ax.axhline(0,lw=.8); ax.set_title("Stage-specific NIM response"); ax.set_xlabel("Horizon"); ax.legend(); ax.grid(alpha=.25); fig.tight_layout(); fig.savefig(outdir/"fig_local_projection.png",dpi=180); plt.close(fig)
+    # allocation latest
+    hist=a6["history"]; w=hist[[f"w_mpc_{b}" for b in BUCKETS]].iloc[-1]
+    fig,ax=plt.subplots(figsize=(9,4.5)); ax.bar(BUCKETS,w.to_numpy()); ax.set_title("Latest feasible allocation weights"); ax.tick_params(axis="x",rotation=25); fig.tight_layout(); fig.savefig(outdir/"fig_latest_allocation.png",dpi=180); plt.close(fig)
+
+
+def run_system(cfg:SystemConfig,force_generate:bool=True) -> dict[str,Any]:
+    np.random.seed(cfg.seed); t0=time.time(); outdir=Path(cfg.out_dir); outdir.mkdir(parents=True,exist_ok=True)
+    panel,yc_gov,yc_cred,params=_load_or_generate(cfg,force_generate)
+
+    # A7 first because its 3-phase label is consumed by A2/A4.
+    a7=recognize_rate_stage(panel,yc_gov,cfg.stage); a7.to_csv(outdir/"A7_rate_stage_and_nim_calibration.csv",index=False,encoding="utf-8-sig")
+
+    # A1: NIM threshold in LPR with DR007 + growth + intercept controls.
+    X=np.column_stack([np.ones(len(panel)),panel["DR007_pct"],panel["g_asset_growth_q"]])
+    a1=hansen_threshold_regression(panel["NIM_state_pct"],X,panel["LPR1_pct"],cfg.threshold)
+    a1["rssGrid"].to_csv(outdir/"A1_threshold_grid.csv",index=False,encoding="utf-8-sig")
+    _write_json(outdir/"A1_threshold_summary.json",{k:v for k,v in a1.items() if k not in {"rssGrid","betaHat"}}|{"betaHat":a1["betaHat"]})
+
+    # A2
+    a2=granger_stage_comparison(panel["LPR1_pct"],panel["NIM_state_pct"],a7["LowRatePhase"],p_max=6,ic_type="BIC",transform_rule="level",allow_stage_lag=False)
+    a2.to_csv(outdir/"A2_granger_full_vs_stages.csv",index=False,encoding="utf-8-sig")
+
+    # A3
+    piv=yc_gov.pivot(index="period",columns="maturity_year",values="yld_pct").reindex(panel["period"].astype(str))
+    mats=np.array(piv.columns,float); Y=piv.to_numpy(float)
+    a3=estimate_shadow_rate(Y,mats,lb=0.0,est_mode="FixParam" if cfg.fast_mode else "MLE",missing_rule="Interpolate",smooth=True,
+                            short_maturity=float(np.min(mats)),compare_series={"DR007":panel["DR007_pct"],"LPR1Y":panel["LPR1_pct"]})
+    pd.DataFrame({"period":panel["period"],"rShadow":a3["rShadow"],"rNominal":a3["rNominal"]}).to_csv(outdir/"A3_shadow_rate.csv",index=False,encoding="utf-8-sig")
+    a3["FitDiag"].to_csv(outdir/"A3_fit_diagnostics.csv",index=False,encoding="utf-8-sig"); _write_json(outdir/"A3_compare_diagnostics.json",a3["CompareDiag"])
+
+    # A4
+    a4=local_projection_stage(panel["LPR1_pct"],panel["NIM_state_pct"],a7["LowRatePhase"],hmax=6 if cfg.fast_mode else 10,p_ctrl=2,shock_scale=0.01)
+    a4.to_csv(outdir/"A4_stage_local_projection.csv",index=False,encoding="utf-8-sig")
+
+    # A5: -10bp / -20bp rate-down examples (rates in decimals inside this module).
+    bs,ba,bl=_make_a5_inputs(panel,params)
+    a5=profitability_elasticity([-0.001,-0.002],bs,ba,bl,horizon_years=1.0,tax_rate=0.25)
+    a5["ScenarioTable"].to_csv(outdir/"A5_profitability_elasticity.csv",index=False,encoding="utf-8-sig"); a5["PlotData"].to_csv(outdir/"A5_plot_data.csv",index=False,encoding="utf-8-sig")
+    _write_json(outdir/"A5_bucket_details.json",a5["DetailTable"])
+
+    # A6
+    a6=run_allocation_engine(panel,yc_gov,yc_cred,params,cfg.allocation)
+    a6["history"].to_csv(outdir/"A6_allocation_history.csv",index=False,encoding="utf-8-sig"); a6["bandwidth"].to_csv(outdir/"A6_latest_bandwidth.csv",index=False,encoding="utf-8-sig")
+    _write_json(outdir/"A6_latest_diagnostics.json",a6["latest_diagnostics"])
+    _write_json(outdir/"A6_model_diagnostics.json",{"hmm_loglik":a6["hmm_loglik"],"state_map":a6["state_map"],"bayes_transition":a6["bayes_transition"],"quantile_forecast":a6["quantile_forecast"]})
+
+    # A8 / A9
+    a8=risk_adjusted_diagnostics(panel,params,a6["bucket_yields"],a6["history"]); a8.to_csv(outdir/"A8_RORAC_RORWA_diagnostics.csv",index=False,encoding="utf-8-sig")
+    a9=stock_and_new_asset_gates(a8,params); a9.to_csv(outdir/"A9_stock_pool_and_gates.csv",index=False,encoding="utf-8-sig")
+
+    # A10
+    a10=run_backtest_and_triggers(panel,a6["history"],a7,params,cfg.trigger_set)
+    a10["BacktestTable"].to_csv(outdir/"A10_backtest.csv",index=False,encoding="utf-8-sig"); a10["TriggerTable"].to_csv(outdir/"A10_trigger_and_correction.csv",index=False,encoding="utf-8-sig")
+
+    # Chinese overview/direction tables evolved from main03.py
+    latest=panel.iloc[-1]; h=a6["history"].iloc[-1]
+    overview=pd.DataFrame([{"期别":latest["period"],"1Y LPR(%)":latest["LPR1_pct"],"DR007(%)":latest["DR007_pct"],"NIM(%)":latest["NIM_state_pct"],
+                            "CAR(%)":latest["CAR_pct"],"LCR(%)":latest["LCR_pct"],"NSFR(%)":latest["NSFR_pct"],"利率阶段":a7.iloc[-1]["RateStage"],
+                            "低利率阶段":a7.iloc[-1]["LowRatePhase"],"约束状态":h["regime"],"触发级别":a10["LatestTriggerLevel"]}])
+    overview.to_csv(outdir/"table_overview_cn.csv",index=False,encoding="utf-8-sig")
+    direction=[]
+    prev=a6["history"].iloc[-2] if len(a6["history"])>1 else h
+    for b in BUCKETS:
+        direction.append({"资产类别":BUCKET_CN[b],"本期权重":h[f"w_mpc_{b}"],"上期权重":prev[f"w_mpc_{b}"],"变动Δ":h[f"w_mpc_{b}"]-prev[f"w_mpc_{b}"],"新增配置结构":h[f"inc_{b}"]})
+    pd.DataFrame(direction).to_csv(outdir/"table_direction_cn.csv",index=False,encoding="utf-8-sig")
+    _plot_outputs(outdir,panel,a7,a3,a4,a6)
+
+    summary={
+        "runtime_seconds":time.time()-t0,"rows":len(panel),"A1":{k:a1[k] for k in ["gammaHat","CIgamma","SupFobs","pValue","Decision1","Decision2"]},
+        "A3_compare":a3["CompareDiag"],"A6_latest":a6["latest_diagnostics"],"A7_latest":a7.iloc[-1].to_dict(),
+        "A10_latest":{"TriggerLevel":a10["LatestTriggerLevel"],"CorrectionAction":a10["LatestCorrectionAction"],"ParameterUpdate":a10["LatestParameterUpdate"]},
+        "output_dir":str(outdir.resolve())}
+    _write_json(outdir/"system_summary.json",summary)
+    return {"panel":panel,"A1":a1,"A2":a2,"A3":a3,"A4":a4,"A5":a5,"A6":a6,"A7":a7,"A8":a8,"A9":a9,"A10":a10,"summary":summary}
+
+
+def parse_args() -> argparse.Namespace:
+    p=argparse.ArgumentParser(description="NIM-State Robust Allocation Research System (A1-A10)")
+    p.add_argument("--out-dir",default="./system_outputs"); p.add_argument("--sim-dir",default="./sim_data")
+    p.add_argument("--full",action="store_true",help="Use MLE shadow-rate mode and a larger bootstrap")
+    p.add_argument("--bootstrap",type=int,default=None); p.add_argument("--mpc",action="store_true"); p.add_argument("--rl",action="store_true")
+    p.add_argument("--reuse-data",action="store_true",help="Reuse existing sim_data instead of regenerating")
+    return p.parse_args()
+
+
+def main_system() -> None:
+    args=parse_args(); cfg=SystemConfig(out_dir=args.out_dir,sim_dir=args.sim_dir,fast_mode=not args.full)
+    if args.bootstrap is not None: cfg.threshold.bootstrap_B=max(19,args.bootstrap)
+    elif args.full: cfg.threshold.bootstrap_B=999
+    cfg.allocation.use_mpc=bool(args.mpc); cfg.allocation.use_rl=bool(args.rl)
+    print("[SYSTEM] Running A1-A10 integrated model...")
+    result=run_system(cfg,force_generate=not args.reuse_data)
+    print("[SYSTEM] Completed. Output directory:",Path(cfg.out_dir).resolve())
+    print("[A1]",result["A1"]["Decision1"],"p=",round(result["A1"]["pValue"],4),"gamma=",round(result["A1"]["gammaHat"],4))
+    print("[A6] latest feasible=",result["A6"]["latest_diagnostics"]["feasible"],"bindings=",result["A6"]["latest_diagnostics"]["binding_report"])
+    print("[A10] trigger=",result["A10"]["LatestTriggerLevel"])
+
+
+if __name__ == "__main__":
+    main_system()
