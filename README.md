@@ -164,3 +164,11 @@ result = run_system(cfg, force_generate=True)
 ```
 
 也可以单独导入 A1—A10 的函数，用于论文复现或单模块检验。
+
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.3
+statsmodels>=0.14
+matplotlib>=3.7
+
