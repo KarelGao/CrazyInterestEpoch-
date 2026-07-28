@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 import pandas as pd
-from scipy import stats
-from scipy.optimize import minimize, lsq_linear
 from scipy.special import logsumexp
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
@@ -20,7 +18,16 @@ try:
     CVXPY_OK = True
 except Exception:
     CVXPY_OK = False
-from common import (BUCKETS, BUCKET_CN, _as_float_array, _finite_rows, _jsonable, _write_json, ols_rss, project_simplex, numerical_gradient, within_demean)
+
+try:
+    import gymnasium as gym
+    from stable_baselines3 import PPO
+    RL_OK = True
+except Exception:
+    gym = None
+    PPO = None
+    RL_OK = False
+from common import BUCKETS, BUCKET_CN
 from config import ThresholdConfig, AllocationConfig, StageConfig, SystemConfig
 from A3_shadow_rate import _interpolate_curve
 
@@ -247,6 +254,13 @@ def derive_bucket_yields(panel: pd.DataFrame, yc_gov: pd.DataFrame, yc_cred: pd.
 
 @dataclass
 class RegulatoryMap:
+    """Map disclosed CAR/LCR/NSFR into linear portfolio constraints.
+
+    The map is calibrated from the observed balance-sheet state.  For a
+    candidate six-bucket weight vector w, the regulatory ratios are recomputed
+    from implied RWA, HQLA and RSF amounts.  This lets CVXPY impose the ratios as
+    true hard constraints after algebraic rearrangement.
+    """
     A_total: float
     capital_amt: float
     nco_amt: float
@@ -258,396 +272,1034 @@ class RegulatoryMap:
     target_sum: float
 
     @classmethod
-    def calibrate(cls,row: pd.Series,w_anchor: np.ndarray,params: pd.DataFrame,target_sum: float | None = None):
-        pp=params.set_index("bucket").loc[BUCKETS]
-        omega=pp["omega_rwa_density"].to_numpy(float)
-        hqla=pp["hqla_ratio"].to_numpy(float)
-        rsf=pp["rsf"].to_numpy(float)
-        duration=pp["duration_year"].to_numpy(float)
-        A=float(row["A_total_assets_rmb_bn"]); target=float(np.sum(w_anchor) if target_sum is None else target_sum)
-        rwa=max(A*(omega@w_anchor),1e-8)
-        cap=float(row["CAR_pct"])/100*rwa
-        hq_amt=max(A*(hqla@w_anchor),1e-8)
-        nco=hq_amt/max(float(row["LCR_pct"])/100,1e-6)
-        rsf_amt=max(A*(rsf@w_anchor),1e-8)
-        asf=float(row["NSFR_pct"])/100*rsf_amt
-        return cls(A,cap,nco,asf,omega,hqla,rsf,duration,target)
+    def calibrate(
+        cls,
+        row: pd.Series,
+        w_anchor: np.ndarray,
+        params: pd.DataFrame,
+        target_sum: float | None = None,
+    ) -> "RegulatoryMap":
+        pp = params.set_index("bucket").loc[BUCKETS]
+        omega = pp["omega_rwa_density"].to_numpy(float)
+        hqla = pp["hqla_ratio"].to_numpy(float)
+        rsf = pp["rsf"].to_numpy(float)
+        duration = pp["duration_year"].to_numpy(float)
 
-    def metrics(self,w: np.ndarray) -> dict[str,float]:
-        w=np.asarray(w,float)
-        rwa=max(self.A_total*(self.omega@w),1e-10)
-        h=max(self.A_total*(self.hqla@w),1e-10)
-        rs=max(self.A_total*(self.rsf@w),1e-10)
+        A = float(row["A_total_assets_rmb_bn"])
+        target = float(np.sum(w_anchor) if target_sum is None else target_sum)
+        rwa = max(A * float(omega @ w_anchor), 1e-10)
+        capital_amt = float(row["CAR_pct"]) / 100.0 * rwa
+
+        hqla_amt = max(A * float(hqla @ w_anchor), 1e-10)
+        nco_amt = hqla_amt / max(float(row["LCR_pct"]) / 100.0, 1e-8)
+
+        rsf_amt = max(A * float(rsf @ w_anchor), 1e-10)
+        asf_amt = float(row["NSFR_pct"]) / 100.0 * rsf_amt
+
+        return cls(
+            A_total=A,
+            capital_amt=capital_amt,
+            nco_amt=nco_amt,
+            asf_amt=asf_amt,
+            omega=omega,
+            hqla=hqla,
+            rsf=rsf,
+            duration=duration,
+            target_sum=target,
+        )
+
+    def limits(self, floors: dict[str, float]) -> dict[str, float]:
+        car = max(float(floors["CAR"]) / 100.0, 1e-8)
+        lcr = max(float(floors["LCR"]) / 100.0, 1e-8)
+        nsfr = max(float(floors["NSFR"]) / 100.0, 1e-8)
         return {
-            "CAR":100*self.capital_amt/rwa,
-            "LCR":100*h/max(self.nco_amt,1e-10),
-            "NSFR":100*self.asf_amt/rs,
-            "duration":float((self.duration@w)/max(np.sum(w),1e-10)),
-            "RWA_intensity":float(self.omega@w),
-            "HQLA_ratio":float(self.hqla@w),
-            "RSF_intensity":float(self.rsf@w),
+            # CAR >= floor  <=> omega'w <= capital / (A * CAR_floor)
+            "rwa_density_max": self.capital_amt / max(self.A_total * car, 1e-12),
+            # LCR >= floor  <=> hqla'w >= (NCO/A) * LCR_floor
+            "hqla_ratio_min": (self.nco_amt / max(self.A_total, 1e-12)) * lcr,
+            # NSFR >= floor <=> rsf'w <= (ASF/A) / NSFR_floor
+            "rsf_intensity_max": (self.asf_amt / max(self.A_total, 1e-12)) / nsfr,
+        }
+
+    def metrics(self, w: np.ndarray) -> dict[str, float]:
+        w = np.asarray(w, float)
+        rwa = max(self.A_total * float(self.omega @ w), 1e-10)
+        hqla_amt = max(self.A_total * float(self.hqla @ w), 1e-10)
+        rsf_amt = max(self.A_total * float(self.rsf @ w), 1e-10)
+        return {
+            "CAR": 100.0 * self.capital_amt / rwa,
+            "LCR": 100.0 * hqla_amt / max(self.nco_amt, 1e-10),
+            "NSFR": 100.0 * self.asf_amt / rsf_amt,
+            "duration": float(self.duration @ w) / max(float(np.sum(w)), 1e-10),
+            "RWA_intensity": float(self.omega @ w),
+            "HQLA_ratio": float(self.hqla @ w),
+            "RSF_intensity": float(self.rsf @ w),
         }
 
 
-def effective_constraint_floors(row: pd.Series,cfg: AllocationConfig,qforecast: dict[str,dict[float,float]]|None=None) -> dict[str,float]:
-    floors={"CAR":cfg.car_min,"LCR":cfg.lcr_min,"NSFR":cfg.nsfr_min}
-    if not qforecast: return floors
-    mapping={"CAR":"CAR_pct","LCR":"LCR_pct","NSFR":"NSFR_pct"}
-    for key,col in mapping.items():
+def _require_cvxpy() -> None:
+    if not CVXPY_OK:
+        raise ImportError(
+            "A6 formal engine requires cvxpy + OSQP/ECOS. Install with: "
+            "pip install cvxpy osqp ecos"
+        )
+
+
+def _require_rl() -> None:
+    if not RL_OK:
+        raise ImportError(
+            "A6 PPO tuner requires gymnasium + stable-baselines3 (+ torch). Install with: "
+            "pip install gymnasium stable-baselines3 torch"
+        )
+
+
+def _as_psd(Sigma: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    S = np.asarray(Sigma, float)
+    S = np.nan_to_num((S + S.T) / 2.0, nan=0.0, posinf=0.0, neginf=0.0)
+    eig = np.linalg.eigvalsh(S)
+    if eig.min() < eps:
+        S = S + np.eye(S.shape[0]) * (eps - eig.min())
+    return S
+
+
+def effective_constraint_floors(
+    row: pd.Series,
+    cfg: AllocationConfig,
+    qforecast: dict[str, dict[float, float]] | None = None,
+) -> dict[str, float]:
+    floors = {"CAR": cfg.car_min, "LCR": cfg.lcr_min, "NSFR": cfg.nsfr_min}
+    if not qforecast:
+        return floors
+    mapping = {"CAR": "CAR_pct", "LCR": "LCR_pct", "NSFR": "NSFR_pct"}
+    for key, col in mapping.items():
         if col in qforecast and cfg.q_delta in qforecast[col]:
-            qlow=float(qforecast[col][cfg.q_delta]); current=float(row[col])
-            uncertainty=max(0.0,current-qlow)
-            floors[key]+=uncertainty
+            qlow = float(qforecast[col][cfg.q_delta])
+            current = float(row[col])
+            floors[key] += max(0.0, current - qlow)
     return floors
 
 
-def allocation_constraints(reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
-                           w_lower: np.ndarray,w_upper: np.ndarray) -> list[dict[str,Any]]:
-    cons=[
-        {"type":"eq","fun":lambda w: np.sum(w)-reg.target_sum},
-        {"type":"ineq","fun":lambda w: reg.metrics(w)["CAR"]-floors["CAR"]},
-        {"type":"ineq","fun":lambda w: reg.metrics(w)["LCR"]-floors["LCR"]},
-        {"type":"ineq","fun":lambda w: reg.metrics(w)["NSFR"]-floors["NSFR"]},
-        {"type":"ineq","fun":lambda w: cfg.duration_cap-reg.metrics(w)["duration"]},
-        {"type":"ineq","fun":lambda w: cfg.trading_cap-w[3]},
-    ]
-    return cons
-
-
-def feasible_slacks(w: np.ndarray,reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
-                    w_lower: np.ndarray,w_upper: np.ndarray) -> dict[str,float]:
-    m=reg.metrics(w)
-    d={
-        "CAR":m["CAR"]-floors["CAR"],"LCR":m["LCR"]-floors["LCR"],"NSFR":m["NSFR"]-floors["NSFR"],
-        "duration":cfg.duration_cap-m["duration"],"trading":cfg.trading_cap-w[3],
-        "lower_min":float(np.min(w-w_lower)),"upper_min":float(np.min(w_upper-w)),
-        "sum_error":float(abs(np.sum(w)-reg.target_sum)),
+def feasible_slacks(
+    w: np.ndarray,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    w_lower: np.ndarray,
+    w_upper: np.ndarray,
+) -> dict[str, float]:
+    m = reg.metrics(w)
+    return {
+        "CAR": m["CAR"] - floors["CAR"],
+        "LCR": m["LCR"] - floors["LCR"],
+        "NSFR": m["NSFR"] - floors["NSFR"],
+        "duration": cfg.duration_cap - m["duration"],
+        "trading": cfg.trading_cap - float(w[3]),
+        "lower_min": float(np.min(np.asarray(w) - w_lower)),
+        "upper_min": float(np.min(w_upper - np.asarray(w))),
+        "sum_error": abs(float(np.sum(w)) - reg.target_sum),
     }
-    return d
 
 
-def is_feasible(w: np.ndarray,reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
-                w_lower: np.ndarray,w_upper: np.ndarray,tol: float=1e-6) -> bool:
-    s=feasible_slacks(w,reg,cfg,floors,w_lower,w_upper)
-    return (min(s[k] for k in ["CAR","LCR","NSFR","duration","trading","lower_min","upper_min"])>=-tol
-            and s["sum_error"]<=1e-5)
+def is_feasible(
+    w: np.ndarray,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    w_lower: np.ndarray,
+    w_upper: np.ndarray,
+    tol: float = 1e-6,
+) -> bool:
+    s = feasible_slacks(w, reg, cfg, floors, w_lower, w_upper)
+    hard = ["CAR", "LCR", "NSFR", "duration", "trading", "lower_min", "upper_min"]
+    return min(s[k] for k in hard) >= -tol and s["sum_error"] <= max(1e-5, tol * 10)
 
 
-def project_to_feasible(w0: np.ndarray,reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
-                        w_lower: np.ndarray,w_upper: np.ndarray) -> tuple[np.ndarray,str]:
-    bounds=list(zip(w_lower,w_upper)); cons=allocation_constraints(reg,cfg,floors,w_lower,w_upper)
-    x0=np.clip(w0,w_lower,w_upper)
-    x0=project_simplex(x0,reg.target_sum)
-    # projection can violate bounds after simplex; use SLSQP from clipped normalized point.
-    res=minimize(lambda w: float(np.sum((w-w0)**2)),x0,method="SLSQP",bounds=bounds,constraints=cons,
-                 options={"maxiter":cfg.solver_maxiter,"ftol":1e-11,"disp":False})
-    if res.success and is_feasible(res.x,reg,cfg,floors,w_lower,w_upper,1e-4): return res.x,"projected"
-    # fallback minimise squared violations + distance
-    def penalty(w):
-        m=reg.metrics(w)
-        v=[max(0,floors["CAR"]-m["CAR"]),max(0,floors["LCR"]-m["LCR"]),max(0,floors["NSFR"]-m["NSFR"]),
-           max(0,m["duration"]-cfg.duration_cap),max(0,w[3]-cfg.trading_cap),abs(np.sum(w)-reg.target_sum)]
-        return np.sum((w-w0)**2)+1e4*np.sum(np.square(v))
-    res2=minimize(penalty,x0,method="SLSQP",bounds=bounds,options={"maxiter":cfg.solver_maxiter,"ftol":1e-11})
-    return np.asarray(res2.x,float),("projected_penalty" if res2.success else "projection_failed")
+def _cvx_constraints(
+    w_expr,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    w_lower: np.ndarray,
+    w_upper: np.ndarray,
+    prefix: str = "",
+) -> tuple[list[Any], dict[str, Any]]:
+    """Create DCP-compliant hard constraints and named dual handles."""
+    lim = reg.limits(floors)
+    cons: list[Any] = []
+    named: dict[str, Any] = {}
+
+    def add(name: str, c) -> None:
+        cons.append(c)
+        named[f"{prefix}{name}"] = c
+
+    add("SUM", cp.sum(w_expr) == reg.target_sum)
+    add("LOWER", w_expr >= w_lower)
+    add("UPPER", w_expr <= w_upper)
+    add("CAR", reg.omega @ w_expr <= lim["rwa_density_max"])
+    add("LCR", reg.hqla @ w_expr >= lim["hqla_ratio_min"])
+    add("NSFR", reg.rsf @ w_expr <= lim["rsf_intensity_max"])
+    add("DURATION", reg.duration @ w_expr <= cfg.duration_cap * reg.target_sum)
+    add("TRADING", w_expr[3] <= cfg.trading_cap)
+    return cons, named
 
 
-def portfolio_utility(w: np.ndarray,mu: np.ndarray,Sigma: np.ndarray,w_prev: np.ndarray,
-                      reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
-                      lambdas: tuple[float,float,float] | None=None) -> float:
-    lv,lc,ll=lambdas or (cfg.lambda_var,cfg.lambda_cap,cfg.lambda_liq)
-    w=np.asarray(w,float); m=reg.metrics(w)
-    ret=float(mu@w); var=float(w@Sigma@w); turn=float(np.sum(np.abs(w-w_prev)))
-    cap_cost=cfg.capital_shadow_base*m["RWA_intensity"]
-    lcr_soft=floors["LCR"]+cfg.safety_lcr_margin; nsfr_soft=floors["NSFR"]+cfg.safety_nsfr_margin
-    liq=(max(0,lcr_soft-m["LCR"])/100)**2*cfg.kappa_lcr+(max(0,nsfr_soft-m["NSFR"])/100)**2*cfg.kappa_nsfr
-    car_soft=floors["CAR"]+cfg.safety_car_margin
-    cap_near=(max(0,car_soft-m["CAR"])/100)**2
-    return ret-lv*var-lc*(cap_cost+cap_near)-ll*liq-cfg.lambda_turn*turn
+def _solver_kwargs(solver: str, cfg: AllocationConfig) -> dict[str, Any]:
+    s = solver.upper()
+    if s == "OSQP":
+        return {
+            "max_iter": cfg.solver_maxiter,
+            "eps_abs": cfg.solver_eps_abs,
+            "eps_rel": cfg.solver_eps_rel,
+            "polishing": True,
+            "verbose": cfg.solver_verbose,
+        }
+    if s == "ECOS":
+        return {
+            "max_iters": cfg.solver_maxiter,
+            "abstol": cfg.solver_eps_abs,
+            "reltol": cfg.solver_eps_rel,
+            "feastol": max(cfg.solver_eps_abs, 1e-8),
+            "verbose": cfg.solver_verbose,
+        }
+    if s == "CLARABEL":
+        return {"max_iter": cfg.solver_maxiter, "verbose": cfg.solver_verbose}
+    if s == "SCS":
+        return {"max_iters": cfg.solver_maxiter, "eps": max(cfg.solver_eps_abs, 1e-6), "verbose": cfg.solver_verbose}
+    return {"verbose": cfg.solver_verbose}
 
 
-def solve_weight_utility(w_anchor: np.ndarray,mu: np.ndarray,Sigma: np.ndarray,reg: RegulatoryMap,
-                         cfg: AllocationConfig,floors: dict[str,float],w_lower: np.ndarray,w_upper: np.ndarray,
-                         lambdas: tuple[float,float,float]|None=None) -> tuple[np.ndarray,dict[str,Any]]:
-    anchor,status=project_to_feasible(w_anchor,reg,cfg,floors,w_lower,w_upper)
-    cons=allocation_constraints(reg,cfg,floors,w_lower,w_upper); bounds=list(zip(w_lower,w_upper))
-    fun=lambda w:-portfolio_utility(w,mu,Sigma,anchor,reg,cfg,floors,lambdas)
-    res=minimize(fun,anchor,method="SLSQP",bounds=bounds,constraints=cons,
-                 options={"maxiter":cfg.solver_maxiter,"ftol":1e-10,"disp":False})
-    w=res.x if res.success and np.all(np.isfinite(res.x)) else anchor
-    return np.asarray(w,float),{"status":("optimal" if res.success else f"fallback:{res.message}"),"projection":status,
-                                "objective":-float(fun(w)),"metrics":reg.metrics(w),"slacks":feasible_slacks(w,reg,cfg,floors,w_lower,w_upper)}
+def _solve_problem(problem, cfg: AllocationConfig) -> tuple[str, str]:
+    _require_cvxpy()
+    installed = {str(s).upper() for s in cp.installed_solvers()}
+    errors = []
+    candidates = list(cfg.cvxpy_solvers)
+    # Numerical fallback remains inside CVXPY; the formal engine never switches
+    # its primary solve to SLSQP.
+    for extra in ("CLARABEL", "SCS"):
+        if extra not in candidates:
+            candidates.append(extra)
+    for solver in candidates:
+        solver = str(solver).upper()
+        if solver not in installed:
+            continue
+        try:
+            problem.solve(solver=solver, **_solver_kwargs(solver, cfg))
+            if problem.status in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}:
+                return str(problem.status), solver
+            errors.append(f"{solver}:{problem.status}")
+        except Exception as exc:
+            errors.append(f"{solver}:{type(exc).__name__}:{exc}")
+    raise RuntimeError(
+        "CVXPY could not solve the A6 optimisation. Installed solvers="
+        f"{sorted(installed)}; attempts={errors}. Install OSQP and ECOS."
+    )
 
 
-def solve_incremental_allocation(w_prev: np.ndarray,growth_q: float,mu: np.ndarray,Sigma: np.ndarray,
-                                 reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
-                                 w_lower: np.ndarray,w_upper: np.ndarray,lambdas: tuple[float,float,float]|None=None) -> tuple[np.ndarray,np.ndarray,dict[str,Any]]:
-    """Solve new-asset mix x; inherited stock remains in place. Returns (w_new, x_increment, diag)."""
-    # Share of current end-period assets represented by current-period net new assets.
-    growth=max(float(growth_q),0.0); a=min(max(growth/(1+growth),1e-4),0.25)
-    target=reg.target_sum
-    x0=project_simplex(np.maximum(w_prev,0),target)
-    xb=[(0.0,target) for _ in BUCKETS]
-    def w_from_x(x): return (1-a)*w_prev+a*np.asarray(x,float)
-    cons=[{"type":"eq","fun":lambda x:np.sum(x)-target}]
-    # hard constraints on resulting stock weights + governance bounds
-    cons.extend([
-        {"type":"ineq","fun":lambda x:reg.metrics(w_from_x(x))["CAR"]-floors["CAR"]},
-        {"type":"ineq","fun":lambda x:reg.metrics(w_from_x(x))["LCR"]-floors["LCR"]},
-        {"type":"ineq","fun":lambda x:reg.metrics(w_from_x(x))["NSFR"]-floors["NSFR"]},
-        {"type":"ineq","fun":lambda x:cfg.duration_cap-reg.metrics(w_from_x(x))["duration"]},
-        {"type":"ineq","fun":lambda x:cfg.trading_cap-w_from_x(x)[3]},
-    ])
-    for i in range(len(BUCKETS)):
-        cons.append({"type":"ineq","fun":lambda x,i=i:w_from_x(x)[i]-w_lower[i]})
-        cons.append({"type":"ineq","fun":lambda x,i=i:w_upper[i]-w_from_x(x)[i]})
-    fun=lambda x:-portfolio_utility(w_from_x(x),mu,Sigma,w_prev,reg,cfg,floors,lambdas)
-    res=minimize(fun,x0,method="SLSQP",bounds=xb,constraints=cons,
-                 options={"maxiter":cfg.solver_maxiter,"ftol":1e-10,"disp":False})
-    if res.success and np.all(np.isfinite(res.x)):
-        x=np.asarray(res.x,float); w=w_from_x(x); status="optimal"
-    else:
-        # fall back to direct feasible weight optimisation, then invert stock-increment equation when possible.
-        w,dd=solve_weight_utility(w_prev,mu,Sigma,reg,cfg,floors,w_lower,w_upper,lambdas)
-        x=(w-(1-a)*w_prev)/a; x=project_simplex(np.maximum(x,0),target); w=w_from_x(x)
-        status=f"fallback_direct:{getattr(res,'message','')};{dd['status']}"
-    diag={"status":status,"growth_share":a,"objective":portfolio_utility(w,mu,Sigma,w_prev,reg,cfg,floors,lambdas),
-          "metrics":reg.metrics(w),"slacks":feasible_slacks(w,reg,cfg,floors,w_lower,w_upper)}
-    return w,x,diag
+def _dual_scalar(c) -> float:
+    try:
+        v = np.asarray(c.dual_value, float)
+        if v.size == 0 or not np.all(np.isfinite(v)):
+            return 0.0
+        return float(np.max(v))
+    except Exception:
+        return 0.0
 
 
-def solve_mpc_incremental(w_prev: np.ndarray,growth_forecast: Sequence[float],mu_forecast: Sequence[np.ndarray],
-                          Sigma: np.ndarray,reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
-                          w_lower: np.ndarray,w_upper: np.ndarray,lambdas: tuple[float,float,float]|None=None) -> tuple[np.ndarray,np.ndarray,dict[str,Any]]:
-    H=min(cfg.mpc_horizon,len(growth_forecast),len(mu_forecast)); n=len(BUCKETS); target=reg.target_sum
-    if H<=1: return solve_incremental_allocation(w_prev,growth_forecast[0],mu_forecast[0],Sigma,reg,cfg,floors,w_lower,w_upper,lambdas)
-    z0=np.tile(project_simplex(np.maximum(w_prev,0),target),H)
-    bounds=[(0,target)]*(H*n)
-    def simulate(z):
-        w=w_prev.copy(); ws=[]; xs=[]
-        for k in range(H):
-            x=z[k*n:(k+1)*n]; g=max(float(growth_forecast[k]),0); a=min(max(g/(1+g),1e-4),0.25)
-            w=(1-a)*w+a*x; ws.append(w.copy()); xs.append(x.copy())
-        return ws,xs
-    cons=[]
+def _extract_regulatory_duals(named: dict[str, Any], prefix: str = "") -> dict[str, float]:
+    return {
+        "mu_CAR": _dual_scalar(named.get(f"{prefix}CAR")),
+        "mu_LCR": _dual_scalar(named.get(f"{prefix}LCR")),
+        "mu_NSFR": _dual_scalar(named.get(f"{prefix}NSFR")),
+        "mu_DURATION": _dual_scalar(named.get(f"{prefix}DURATION")),
+        "mu_TRADING": _dual_scalar(named.get(f"{prefix}TRADING")),
+    }
+
+
+def _utility_expr(
+    w_expr,
+    mu: np.ndarray,
+    Sigma: np.ndarray,
+    w_prev: np.ndarray,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    lambdas: tuple[float, float, float] | None = None,
+):
+    """Concave utility used by both single-step optimisation and MPC."""
+    lv, lc, ll = lambdas or (cfg.lambda_var, cfg.lambda_cap, cfg.lambda_liq)
+    S = _as_psd(Sigma)
+    lim_soft = reg.limits({
+        "CAR": floors["CAR"] + cfg.safety_car_margin,
+        "LCR": floors["LCR"] + cfg.safety_lcr_margin,
+        "NSFR": floors["NSFR"] + cfg.safety_nsfr_margin,
+    })
+
+    expected_return = mu @ w_expr
+    variance = cp.quad_form(w_expr, S)
+    turnover = cp.norm1(w_expr - w_prev)
+
+    # Capital and liquidity penalties are soft margins *inside* the hard
+    # regulatory feasible set.  Their coefficients are the only quantities
+    # tuned by PPO.
+    cap_usage = cfg.capital_shadow_base * (reg.omega @ w_expr)
+    cap_near = cp.pos((reg.omega @ w_expr) - lim_soft["rwa_density_max"])
+    liq_gap = cp.pos(lim_soft["hqla_ratio_min"] - (reg.hqla @ w_expr))
+    nsfr_gap = cp.pos((reg.rsf @ w_expr) - lim_soft["rsf_intensity_max"])
+    liq_usage = cfg.liquidity_shadow_base * (
+        cfg.kappa_lcr * liq_gap + cfg.kappa_nsfr * nsfr_gap
+    )
+
+    return (
+        expected_return
+        - lv * variance
+        - lc * (cap_usage + cap_near)
+        - ll * liq_usage
+        - cfg.lambda_turn * turnover
+    )
+
+
+def portfolio_utility(
+    w: np.ndarray,
+    mu: np.ndarray,
+    Sigma: np.ndarray,
+    w_prev: np.ndarray,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    lambdas: tuple[float, float, float] | None = None,
+) -> float:
+    """Numpy equivalent used for diagnostics and PPO rewards."""
+    lv, lc, ll = lambdas or (cfg.lambda_var, cfg.lambda_cap, cfg.lambda_liq)
+    w = np.asarray(w, float)
+    S = _as_psd(Sigma)
+    m = reg.metrics(w)
+    lim_soft = reg.limits({
+        "CAR": floors["CAR"] + cfg.safety_car_margin,
+        "LCR": floors["LCR"] + cfg.safety_lcr_margin,
+        "NSFR": floors["NSFR"] + cfg.safety_nsfr_margin,
+    })
+    ret = float(mu @ w)
+    var = float(w @ S @ w)
+    turn = float(np.sum(np.abs(w - w_prev)))
+    cap_usage = cfg.capital_shadow_base * m["RWA_intensity"]
+    cap_near = max(0.0, m["RWA_intensity"] - lim_soft["rwa_density_max"])
+    liq_gap = max(0.0, lim_soft["hqla_ratio_min"] - m["HQLA_ratio"])
+    nsfr_gap = max(0.0, m["RSF_intensity"] - lim_soft["rsf_intensity_max"])
+    liq_usage = cfg.liquidity_shadow_base * (cfg.kappa_lcr * liq_gap + cfg.kappa_nsfr * nsfr_gap)
+    return ret - lv * var - lc * (cap_usage + cap_near) - ll * liq_usage - cfg.lambda_turn * turn
+
+
+def project_to_feasible(
+    w0: np.ndarray,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    w_lower: np.ndarray,
+    w_upper: np.ndarray,
+) -> tuple[np.ndarray, str]:
+    _require_cvxpy()
+    w = cp.Variable(len(BUCKETS))
+    constraints, _ = _cvx_constraints(w, reg, cfg, floors, w_lower, w_upper)
+    problem = cp.Problem(cp.Minimize(cp.sum_squares(w - np.asarray(w0, float))), constraints)
+    try:
+        status, solver = _solve_problem(problem, cfg)
+        out = np.asarray(w.value, float).reshape(-1)
+        return out, f"{status}:{solver}"
+    except Exception as exc:
+        raise RuntimeError(f"No feasible A6 portfolio under current hard constraints: {exc}") from exc
+
+
+def solve_weight_cvxpy(
+    w_anchor: np.ndarray,
+    mu: np.ndarray,
+    Sigma: np.ndarray,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    w_lower: np.ndarray,
+    w_upper: np.ndarray,
+    lambdas: tuple[float, float, float] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    anchor, projection_status = project_to_feasible(w_anchor, reg, cfg, floors, w_lower, w_upper)
+    w = cp.Variable(len(BUCKETS))
+    constraints, named = _cvx_constraints(w, reg, cfg, floors, w_lower, w_upper)
+    objective = cp.Maximize(_utility_expr(w, mu, Sigma, anchor, reg, cfg, floors, lambdas))
+    problem = cp.Problem(objective, constraints)
+    status, solver = _solve_problem(problem, cfg)
+    w_star = np.asarray(w.value, float).reshape(-1)
+    return w_star, {
+        "status": f"{status}:{solver}",
+        "projection": projection_status,
+        "objective": float(problem.value),
+        "metrics": reg.metrics(w_star),
+        "slacks": feasible_slacks(w_star, reg, cfg, floors, w_lower, w_upper),
+        "duals": _extract_regulatory_duals(named),
+    }
+
+
+def _growth_share(growth_q: float) -> float:
+    g = max(float(growth_q), 0.0)
+    return min(max(g / (1.0 + g), 1e-4), 0.25)
+
+
+def solve_incremental_allocation(
+    w_prev: np.ndarray,
+    growth_q: float,
+    mu: np.ndarray,
+    Sigma: np.ndarray,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    w_lower: np.ndarray,
+    w_upper: np.ndarray,
+    lambdas: tuple[float, float, float] | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """CVXPY stock/increment dual-track solve.
+
+    x is the allocation mix of *new* assets.  Existing stock is inherited by
+    w_t = (1-a_t) w_{t-1} + a_t x_t, so the optimiser cannot instantaneously
+    rewrite the whole balance sheet.
+    """
+    _require_cvxpy()
+    n = len(BUCKETS)
+    a = _growth_share(growth_q)
+    target = reg.target_sum
+
+    x = cp.Variable(n)
+    w_expr = (1.0 - a) * np.asarray(w_prev, float) + a * x
+    constraints = [cp.sum(x) == target, x >= 0.0, x <= target]
+    hard, named = _cvx_constraints(w_expr, reg, cfg, floors, w_lower, w_upper)
+    constraints += hard
+    objective = cp.Maximize(_utility_expr(w_expr, mu, Sigma, w_prev, reg, cfg, floors, lambdas))
+    problem = cp.Problem(objective, constraints)
+
+    try:
+        status, solver = _solve_problem(problem, cfg)
+        x_star = np.asarray(x.value, float).reshape(-1)
+        w_star = (1.0 - a) * np.asarray(w_prev, float) + a * x_star
+        diag = {
+            "status": f"optimal_cvx_incremental:{status}:{solver}",
+            "growth_share": a,
+            "objective": float(problem.value),
+            "metrics": reg.metrics(w_star),
+            "slacks": feasible_slacks(w_star, reg, cfg, floors, w_lower, w_upper),
+            "duals": _extract_regulatory_duals(named),
+        }
+        return w_star, x_star, diag
+    except Exception:
+        # A CVXPY direct-weight repair is still within the formal convex
+        # optimisation stack; no SLSQP substitution is made.
+        w_star, dd = solve_weight_cvxpy(
+            w_prev, mu, Sigma, reg, cfg, floors, w_lower, w_upper, lambdas
+        )
+        x_star = (w_star - (1.0 - a) * np.asarray(w_prev, float)) / a
+        # If the inherited-stock equation is numerically incompatible with a
+        # nonnegative x, report the repaired stock and use a normalised display
+        # mix rather than pretending the inversion is exact.
+        x_show = np.maximum(x_star, 0.0)
+        if x_show.sum() > 0:
+            x_show *= target / x_show.sum()
+        else:
+            x_show = np.full(n, target / n)
+        dd["status"] = "cvx_direct_weight_repair:" + dd["status"]
+        dd["growth_share"] = a
+        return w_star, x_show, dd
+
+
+def solve_mpc_incremental(
+    w_prev: np.ndarray,
+    growth_forecast: Sequence[float],
+    mu_forecast: Sequence[np.ndarray],
+    Sigma: np.ndarray,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    w_lower: np.ndarray,
+    w_upper: np.ndarray,
+    lambdas: tuple[float, float, float] | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Multi-period convex MPC; returns only the first control action."""
+    _require_cvxpy()
+    H = min(cfg.mpc_horizon, len(growth_forecast), len(mu_forecast))
+    if H <= 1:
+        return solve_incremental_allocation(
+            w_prev, growth_forecast[0], mu_forecast[0], Sigma, reg, cfg,
+            floors, w_lower, w_upper, lambdas
+        )
+
+    n = len(BUCKETS)
+    target = reg.target_sum
+    X = cp.Variable((H, n))
+    constraints: list[Any] = []
+    named_first: dict[str, Any] = {}
+    W: list[Any] = []
+    prev_expr: Any = np.asarray(w_prev, float)
+
     for k in range(H):
-        cons.append({"type":"eq","fun":lambda z,k=k:np.sum(z[k*n:(k+1)*n])-target})
-        for i in range(n):
-            cons.append({"type":"ineq","fun":lambda z,k=k,i=i:simulate(z)[0][k][i]-w_lower[i]})
-            cons.append({"type":"ineq","fun":lambda z,k=k,i=i:w_upper[i]-simulate(z)[0][k][i]})
-        cons += [
-            {"type":"ineq","fun":lambda z,k=k:reg.metrics(simulate(z)[0][k])["CAR"]-floors["CAR"]},
-            {"type":"ineq","fun":lambda z,k=k:reg.metrics(simulate(z)[0][k])["LCR"]-floors["LCR"]},
-            {"type":"ineq","fun":lambda z,k=k:reg.metrics(simulate(z)[0][k])["NSFR"]-floors["NSFR"]},
-            {"type":"ineq","fun":lambda z,k=k:cfg.duration_cap-reg.metrics(simulate(z)[0][k])["duration"]},
-            {"type":"ineq","fun":lambda z,k=k:cfg.trading_cap-simulate(z)[0][k][3]},
-        ]
-    def obj(z):
-        ws,_=simulate(z); val=0.0; prev=w_prev
-        for k,w in enumerate(ws):
-            val+=(cfg.discount**k)*portfolio_utility(w,mu_forecast[k],Sigma,prev,reg,cfg,floors,lambdas); prev=w
-        return -val
-    res=minimize(obj,z0,method="SLSQP",bounds=bounds,constraints=cons,
-                 options={"maxiter":cfg.solver_maxiter,"ftol":1e-9,"disp":False})
-    if not res.success:
-        return solve_incremental_allocation(w_prev,growth_forecast[0],mu_forecast[0],Sigma,reg,cfg,floors,w_lower,w_upper,lambdas)
-    ws,xs=simulate(res.x)
-    return ws[0],xs[0],{"status":"optimal_mpc","objective":-float(res.fun),"metrics":reg.metrics(ws[0]),
-                        "slacks":feasible_slacks(ws[0],reg,cfg,floors,w_lower,w_upper),"growth_share":max(float(growth_forecast[0]),0)/(1+max(float(growth_forecast[0]),0))}
+        a = _growth_share(float(growth_forecast[k]))
+        wk = (1.0 - a) * prev_expr + a * X[k, :]
+        W.append(wk)
+        constraints += [cp.sum(X[k, :]) == target, X[k, :] >= 0.0, X[k, :] <= target]
+        hard, named = _cvx_constraints(wk, reg, cfg, floors, w_lower, w_upper, prefix=f"t{k}_")
+        constraints += hard
+        if k == 0:
+            named_first = named
+        prev_expr = wk
+
+    value = 0
+    prev_for_turn: Any = np.asarray(w_prev, float)
+    for k in range(H):
+        value += (cfg.discount ** k) * _utility_expr(
+            W[k], np.asarray(mu_forecast[k], float), Sigma, prev_for_turn,
+            reg, cfg, floors, lambdas
+        )
+        prev_for_turn = W[k]
+
+    problem = cp.Problem(cp.Maximize(value), constraints)
+    try:
+        status, solver = _solve_problem(problem, cfg)
+        x0 = np.asarray(X.value[0], float).reshape(-1)
+        a0 = _growth_share(float(growth_forecast[0]))
+        w0 = (1.0 - a0) * np.asarray(w_prev, float) + a0 * x0
+        return w0, x0, {
+            "status": f"optimal_cvx_mpc:{status}:{solver}",
+            "growth_share": a0,
+            "objective": float(problem.value),
+            "metrics": reg.metrics(w0),
+            "slacks": feasible_slacks(w0, reg, cfg, floors, w_lower, w_upper),
+            "duals": _extract_regulatory_duals(named_first, prefix="t0_"),
+            "mpc_horizon_used": H,
+        }
+    except Exception:
+        return solve_incremental_allocation(
+            w_prev, growth_forecast[0], mu_forecast[0], Sigma, reg, cfg,
+            floors, w_lower, w_upper, lambdas
+        )
 
 
-def compute_bandwidth(w_anchor: np.ndarray,reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float],
-                      w_lower: np.ndarray,w_upper: np.ndarray) -> pd.DataFrame:
-    anchor,_=project_to_feasible(w_anchor,reg,cfg,floors,w_lower,w_upper)
-    cons=allocation_constraints(reg,cfg,floors,w_lower,w_upper); bounds=list(zip(w_lower,w_upper)); rows=[]
-    for i,b in enumerate(BUCKETS):
-        def fmin(w): return w[i]+cfg.bandwidth_rho*np.sum((w-anchor)**2)
-        def fmax(w): return -w[i]+cfg.bandwidth_rho*np.sum((w-anchor)**2)
-        lo=minimize(fmin,anchor,method="SLSQP",bounds=bounds,constraints=cons,options={"maxiter":cfg.solver_maxiter,"ftol":1e-10})
-        hi=minimize(fmax,anchor,method="SLSQP",bounds=bounds,constraints=cons,options={"maxiter":cfg.solver_maxiter,"ftol":1e-10})
-        lv=float(lo.x[i]) if lo.success else float(anchor[i]); hv=float(hi.x[i]) if hi.success else float(anchor[i])
-        rows.append({"bucket":b,"bucket_cn":BUCKET_CN[b],"anchor":float(anchor[i]),"lower":lv,"upper":hv,"width":max(0,hv-lv),
-                     "lower_status":bool(lo.success),"upper_status":bool(hi.success)})
+def compute_bandwidth(
+    w_anchor: np.ndarray,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    w_lower: np.ndarray,
+    w_upper: np.ndarray,
+) -> pd.DataFrame:
+    """CVXPY feasible-set scan for per-bucket lower/upper configuration bands."""
+    _require_cvxpy()
+    anchor, _ = project_to_feasible(w_anchor, reg, cfg, floors, w_lower, w_upper)
+    rows = []
+    for i, b in enumerate(BUCKETS):
+        # Lower boundary
+        w_lo = cp.Variable(len(BUCKETS))
+        cons_lo, _ = _cvx_constraints(w_lo, reg, cfg, floors, w_lower, w_upper)
+        p_lo = cp.Problem(
+            cp.Minimize(w_lo[i] + cfg.bandwidth_rho * cp.sum_squares(w_lo - anchor)),
+            cons_lo,
+        )
+        try:
+            st_lo, sol_lo = _solve_problem(p_lo, cfg)
+            lower = float(w_lo.value[i])
+            low_status = f"{st_lo}:{sol_lo}"
+        except Exception as exc:
+            lower = float(anchor[i])
+            low_status = f"failed:{type(exc).__name__}"
+
+        # Upper boundary
+        w_hi = cp.Variable(len(BUCKETS))
+        cons_hi, _ = _cvx_constraints(w_hi, reg, cfg, floors, w_lower, w_upper)
+        p_hi = cp.Problem(
+            cp.Maximize(w_hi[i] - cfg.bandwidth_rho * cp.sum_squares(w_hi - anchor)),
+            cons_hi,
+        )
+        try:
+            st_hi, sol_hi = _solve_problem(p_hi, cfg)
+            upper = float(w_hi.value[i])
+            high_status = f"{st_hi}:{sol_hi}"
+        except Exception as exc:
+            upper = float(anchor[i])
+            high_status = f"failed:{type(exc).__name__}"
+
+        rows.append({
+            "bucket": b,
+            "bucket_cn": BUCKET_CN[b],
+            "anchor": float(anchor[i]),
+            "lower": lower,
+            "upper": upper,
+            "width": max(0.0, upper - lower),
+            "lower_status": low_status,
+            "upper_status": high_status,
+        })
     return pd.DataFrame(rows)
 
 
-def approximate_shadow_prices(w_star: np.ndarray,mu: np.ndarray,Sigma: np.ndarray,w_prev: np.ndarray,
-                              reg: RegulatoryMap,cfg: AllocationConfig,floors: dict[str,float]) -> dict[str,float]:
-    """Approximate KKT multipliers for regulatory constraints by local stationarity least squares."""
-    util=lambda w:portfolio_utility(w,mu,Sigma,w_prev,reg,cfg,floors)
-    gradU=numerical_gradient(util,w_star,1e-5)
-    names=["CAR","LCR","NSFR"]
-    cols=[]; active=[]
-    for name in names:
-        def gfun(w,name=name): return floors[name]-reg.metrics(w)[name]
-        slack=reg.metrics(w_star)[name]-floors[name]
-        # include constraints that are relatively close; far constraints have zero multiplier.
-        scale={"CAR":1.0,"LCR":10.0,"NSFR":3.0}[name]
-        if slack <= scale:
-            cols.append(numerical_gradient(gfun,w_star,1e-5)); active.append(name)
-    result={f"mu_{n}":0.0 for n in names}
-    if not cols: return result
-    # grad U = J_g^T mu + 1*nu; mu>=0, nu free
-    M=np.column_stack(cols+[np.ones(len(w_star))])
-    lb=np.r_[np.zeros(len(cols)),-np.inf]; ub=np.r_[np.full(len(cols),np.inf),np.inf]
-    fit=lsq_linear(M,gradU,bounds=(lb,ub))
-    for j,n in enumerate(active): result[f"mu_{n}"]=float(max(fit.x[j],0))
-    result["stationarity_resid"]=float(np.linalg.norm(M@fit.x-gradU))
-    return result
+def boundary_step(
+    w_anchor: np.ndarray,
+    direction: np.ndarray,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    w_lower: np.ndarray,
+    w_upper: np.ndarray,
+) -> tuple[float, list[str]]:
+    """One-dimensional boundary scan used only for reporting η_max."""
+    d = np.asarray(direction, float)
+    norm = np.linalg.norm(d)
+    if norm < 1e-12:
+        return 0.0, []
+    d = d / norm
 
+    def ok(eta: float) -> bool:
+        return is_feasible(w_anchor + eta * d, reg, cfg, floors, w_lower, w_upper, 1e-7)
 
-def boundary_step(w_anchor: np.ndarray,direction: np.ndarray,reg: RegulatoryMap,cfg: AllocationConfig,
-                  floors: dict[str,float],w_lower: np.ndarray,w_upper: np.ndarray) -> tuple[float,list[str]]:
-    d=np.asarray(direction,float)
-    norm=np.linalg.norm(d)
-    if norm<1e-12: return 0.0,[]
-    d=d/norm
-    def ok(eta): return is_feasible(w_anchor+eta*d,reg,cfg,floors,w_lower,w_upper,1e-7)
-    lo,hi=0.0,0.05
-    while hi<5.0 and ok(hi): lo=hi; hi*=2
-    for _ in range(50):
-        mid=(lo+hi)/2
-        if ok(mid): lo=mid
-        else: hi=mid
-    w=w_anchor+lo*d; s=feasible_slacks(w,reg,cfg,floors,w_lower,w_upper)
-    bind=[]
-    tol={"CAR":1e-3,"LCR":1e-2,"NSFR":1e-2,"duration":1e-3,"trading":1e-4,"lower_min":1e-4,"upper_min":1e-4}
-    for k in tol:
-        if s[k]<=tol[k]: bind.append(k)
-    return float(lo),bind
-
-
-class GovernanceSafeQLearner:
-    """Tiny tabular Q-learner. Actions only select penalty multipliers; never asset weights."""
-    def __init__(self,base_lambdas: tuple[float,float,float],seed: int=0):
-        self.base=np.asarray(base_lambdas,float); self.rng=np.random.default_rng(seed)
-        self.actions=np.array([
-            [0.7,0.8,0.8],[1.0,1.0,1.0],[1.3,1.0,1.0],[1.0,1.3,1.0],[1.0,1.0,1.3],
-            [1.3,1.3,1.0],[1.3,1.0,1.3],[1.0,1.3,1.3],[1.4,1.4,1.4]
-        ])
-        self.Q={}
-    def state(self,p_hard:float,slacks:dict[str,float]) -> tuple[int,int,int,int]:
-        r=2 if p_hard>0.6 else (1 if p_hard>0.3 else 0)
-        return (r,int(slacks.get("CAR",9)<0.5),int(slacks.get("LCR",99)<10),int(slacks.get("NSFR",99)<3))
-    def choose(self,s,eps=0.1):
-        q=self.Q.setdefault(s,np.zeros(len(self.actions)))
-        if self.rng.random()<eps:return int(self.rng.integers(len(self.actions)))
-        return int(np.argmax(q))
-    def lambdas(self,a:int)->tuple[float,float,float]:
-        return tuple((self.base*self.actions[a]).tolist())
-    def update(self,s,a,reward,s2,alpha=0.15,gamma=0.90):
-        q=self.Q.setdefault(s,np.zeros(len(self.actions))); q2=self.Q.setdefault(s2,np.zeros(len(self.actions)))
-        q[a]+=alpha*(reward+gamma*np.max(q2)-q[a])
-
-
-def train_penalty_qlearner(panel: pd.DataFrame,params: pd.DataFrame,yields: pd.DataFrame,gamma: np.ndarray,state_map: dict[int,str],
-                           cfg: AllocationConfig,episodes:int=4) -> GovernanceSafeQLearner:
-    learner=GovernanceSafeQLearner((cfg.lambda_var,cfg.lambda_cap,cfg.lambda_liq),cfg.seed)
-    pp=params.set_index("bucket").loc[BUCKETS]
-    base_vol=np.array([0.10,0.06,0.03,0.12,0.02,0.09])/100
-    Sigma=0.75*np.diag(base_vol**2)+0.25*np.outer(base_vol,base_vol)
-    lo=np.asarray(cfg.w_lower,float); hi=np.asarray(cfg.w_upper,float)
-    hard_idx=[k for k,v in state_map.items() if v=="hardening"]
-    for ep in range(episodes):
-        w=panel[[f"w_{b}" for b in BUCKETS]].iloc[0].to_numpy(float)
-        for t in range(len(panel)-1):
-            row=panel.iloc[t]; w_obs=row[[f"w_{b}" for b in BUCKETS]].to_numpy(float); reg=RegulatoryMap.calibrate(row,w_obs,params,target_sum=float(np.sum(w))); floors={"CAR":cfg.car_min,"LCR":cfg.lcr_min,"NSFR":cfg.nsfr_min}
-            sl=feasible_slacks(w,reg,cfg,floors,lo,hi); ph=float(gamma[t,hard_idx].sum()) if hard_idx else 0.0
-            s=learner.state(ph,sl); a=learner.choose(s,eps=max(0.05,0.25*(1-ep/max(episodes,1))))
-            lam=learner.lambdas(a)
-            mu=(yields.iloc[t].to_numpy(float)-float(row["rL_avg_interest_bearing_cost_pct"]))/100
-            wn,_,diag=solve_incremental_allocation(w,float(row["g_asset_growth_q"]),mu,Sigma,reg,cfg,floors,lo,hi,lam)
-            violation=sum(max(0,-v) for k,v in diag["slacks"].items() if k in {"CAR","LCR","NSFR","duration","trading"})
-            reward=float(diag["objective"])-50*violation-0.2*np.sum(abs(wn-w))
-            r2=panel.iloc[t+1]; wobs2=r2[[f"w_{b}" for b in BUCKETS]].to_numpy(float); reg2=RegulatoryMap.calibrate(r2,wobs2,params,target_sum=float(np.sum(wn))); sl2=feasible_slacks(wn,reg2,cfg,floors,lo,hi)
-            ph2=float(gamma[t+1,hard_idx].sum()) if hard_idx else 0.0; s2=learner.state(ph2,sl2)
-            learner.update(s,a,reward,s2); w=wn
-    return learner
-
-
-def run_allocation_engine(panel: pd.DataFrame,yc_gov: pd.DataFrame,yc_cred: pd.DataFrame,params: pd.DataFrame,
-                          cfg: AllocationConfig) -> dict[str,Any]:
-    feats,fnames=build_hmm_features(panel,params); scaler=StandardScaler(); Xs=scaler.fit_transform(feats)
-    hmm=init_hmm(Xs,3,cfg.seed); hmm_ll=hmm.em_train(Xs,50,1e-4)
-    gamma,xi,_=hmm.forward_backward(Xs); state_map=map_hmm_regimes(hmm,scaler,fnames)
-    A_bayes=bayes_transition_mean(xi,1.0)
-    hard_idx=[k for k,v in state_map.items() if v=="hardening"]
-    hard_prob=gamma[:,hard_idx].sum(axis=1) if hard_idx else np.zeros(len(panel))
-    bayes=dynamic_bayesian_nim_regression(panel,hard_prob) if cfg.use_bayes else None
-    qforecast=quantile_forecast_latest(panel,yc_gov,gamma,(cfg.q_delta,0.5,1-cfg.q_delta),cfg.seed) if cfg.use_quantile else {}
-    yields=derive_bucket_yields(panel,yc_gov,yc_cred)
-
-    # rolling covariance from reconstructed bucket yields; fallback covariance is always PSD.
-    Yret=yields.to_numpy(float)/100
-    cov=np.cov(np.diff(Yret,axis=0).T) if len(Yret)>8 else np.diag(np.full(6,1e-4))
-    cov=np.nan_to_num(cov,nan=0.0,posinf=0.0,neginf=0.0)+(1e-8*np.eye(6))
-    eig=np.linalg.eigvalsh(cov)
-    if eig.min()<1e-10: cov+=np.eye(6)*(1e-10-eig.min())
-    lo=np.asarray(cfg.w_lower,float); hi=np.asarray(cfg.w_upper,float)
-
-    learner=None
-    if cfg.use_rl:
-        learner=train_penalty_qlearner(panel,params,yields,gamma,state_map,cfg,episodes=4)
-
-    rows=[]; w=panel[[f"w_{b}" for b in BUCKETS]].iloc[0].to_numpy(float)
-    for t in range(len(panel)):
-        row=panel.iloc[t]
-        w_obs=row[[f"w_{b}" for b in BUCKETS]].to_numpy(float)
-        reg=RegulatoryMap.calibrate(row,w_obs,params,target_sum=float(np.sum(w)))
-        qf=qforecast if t==len(panel)-1 else None
-        floors=effective_constraint_floors(row,cfg,qf)
-        # If chance buffer makes current state infeasible beyond repair, revert to statutory/management hard floors.
-        test_anchor,_=project_to_feasible(w,reg,cfg,floors,lo,hi)
-        if not is_feasible(test_anchor,reg,cfg,floors,lo,hi,1e-3):
-            floors={"CAR":cfg.car_min,"LCR":cfg.lcr_min,"NSFR":cfg.nsfr_min}
-        # expected net return by bucket, with a small haircut-loss adjustment linked to market volatility.
-        mu=(yields.iloc[t].to_numpy(float)-float(row["rL_avg_interest_bearing_cost_pct"]))/100
-        hc=params.set_index("bucket").loc[BUCKETS,"haircut"].to_numpy(float)
-        vol=float(np.std(np.diff(yc_gov[yc_gov["maturity_year"]==10]["yld_pct"].to_numpy(float)[:max(t+1,2)]))) if t>1 else 0.0
-        mu=mu-hc*max(vol,0)/100
-
-        lambdas=(cfg.lambda_var,cfg.lambda_cap,cfg.lambda_liq)
-        if learner is not None:
-            s=learner.state(float(hard_prob[t]),feasible_slacks(w,reg,cfg,floors,lo,hi)); a=learner.choose(s,eps=0.0); lambdas=learner.lambdas(a)
-        if cfg.use_mpc and t<len(panel)-1:
-            H=min(cfg.mpc_horizon,len(panel)-t)
-            growth=panel["g_asset_growth_q"].iloc[t:t+H].to_numpy(float)
-            mus=[]
-            for kk in range(H):
-                rr=panel.iloc[t+kk]; mus.append((yields.iloc[t+kk].to_numpy(float)-float(rr["rL_avg_interest_bearing_cost_pct"]))/100)
-            wn,xinc,diag=solve_mpc_incremental(w,growth,mus,cov,reg,cfg,floors,lo,hi,lambdas)
+    lo, hi = 0.0, 0.01
+    while hi < 2.0 and ok(hi):
+        lo, hi = hi, hi * 2.0
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        if ok(mid):
+            lo = mid
         else:
-            wn,xinc,diag=solve_incremental_allocation(w,float(row["g_asset_growth_q"]),mu,cov,reg,cfg,floors,lo,hi,lambdas)
-        pcont=pexp=phard=0.0
+            hi = mid
+
+    w_edge = w_anchor + lo * d
+    s = feasible_slacks(w_edge, reg, cfg, floors, w_lower, w_upper)
+    tolerances = {
+        "CAR": 1e-3,
+        "LCR": 1e-2,
+        "NSFR": 1e-2,
+        "duration": 1e-3,
+        "trading": 1e-4,
+        "lower_min": 1e-4,
+        "upper_min": 1e-4,
+    }
+    binding = [k for k, tol in tolerances.items() if s[k] <= tol]
+    return float(lo), binding
+
+
+def _rl_observation(
+    row: pd.Series,
+    w: np.ndarray,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    hard_prob: float,
+    w_lower: np.ndarray,
+    w_upper: np.ndarray,
+) -> np.ndarray:
+    sl = feasible_slacks(w, reg, cfg, floors, w_lower, w_upper)
+    target = max(reg.target_sum, 1e-8)
+    obs = np.r_[
+        np.clip(hard_prob, 0.0, 1.0),
+        np.clip(sl["CAR"] / 5.0, -5.0, 5.0),
+        np.clip(sl["LCR"] / 50.0, -5.0, 5.0),
+        np.clip(sl["NSFR"] / 10.0, -5.0, 5.0),
+        np.clip(float(row["NIM_state_pct"]) / 3.0, -5.0, 5.0),
+        np.clip(float(row["LPR1_pct"]) / 5.0, -5.0, 5.0),
+        np.clip(float(row["DR007_pct"]) / 4.0, -5.0, 5.0),
+        np.clip(float(row["g_asset_growth_q"]) * 10.0, -5.0, 5.0),
+        np.asarray(w, float) / target,
+    ].astype(np.float32)
+    return np.clip(obs, -10.0, 10.0)
+
+
+def _action_to_lambdas(action: np.ndarray, cfg: AllocationConfig) -> tuple[float, float, float]:
+    a = np.clip(np.asarray(action, float).reshape(3), -1.0, 1.0)
+    z = (a + 1.0) / 2.0
+    lo = max(cfg.ppo_lambda_min_mult, 1e-4)
+    hi = max(cfg.ppo_lambda_max_mult, lo + 1e-4)
+    mult = np.exp(np.log(lo) + z * (np.log(hi) - np.log(lo)))
+    base = np.array([cfg.lambda_var, cfg.lambda_cap, cfg.lambda_liq], float)
+    return tuple((base * mult).tolist())
+
+
+if RL_OK:
+    class PenaltyTuneEnv(gym.Env):
+        """Governance-safe PPO environment.
+
+        PPO observes regime/constraint/balance-sheet state and chooses only
+        three penalty multipliers.  It never has an action dimension for any
+        asset weight.  The six asset weights are always produced by CVXPY.
+        """
+
+        metadata = {"render_modes": []}
+
+        def __init__(
+            self,
+            panel: pd.DataFrame,
+            params: pd.DataFrame,
+            yields: pd.DataFrame,
+            hard_prob: np.ndarray,
+            Sigma: np.ndarray,
+            cfg: AllocationConfig,
+        ):
+            super().__init__()
+            self.panel = panel.reset_index(drop=True)
+            self.params = params
+            self.yields = yields.reset_index(drop=True)
+            self.hard_prob = np.asarray(hard_prob, float)
+            self.Sigma = _as_psd(Sigma)
+            self.cfg = cfg
+            self.lower = np.asarray(cfg.w_lower, float)
+            self.upper = np.asarray(cfg.w_upper, float)
+            self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
+            self.observation_space = gym.spaces.Box(-10.0, 10.0, shape=(8 + len(BUCKETS),), dtype=np.float32)
+            self.t = 0
+            self.w = self.panel[[f"w_{b}" for b in BUCKETS]].iloc[0].to_numpy(float)
+
+        def _state(self) -> np.ndarray:
+            row = self.panel.iloc[self.t]
+            w_obs = row[[f"w_{b}" for b in BUCKETS]].to_numpy(float)
+            reg = RegulatoryMap.calibrate(row, w_obs, self.params, target_sum=float(np.sum(self.w)))
+            floors = {"CAR": self.cfg.car_min, "LCR": self.cfg.lcr_min, "NSFR": self.cfg.nsfr_min}
+            return _rl_observation(
+                row, self.w, reg, self.cfg, floors, float(self.hard_prob[self.t]),
+                self.lower, self.upper
+            )
+
+        def reset(self, *, seed=None, options=None):
+            super().reset(seed=seed)
+            self.t = 0
+            self.w = self.panel[[f"w_{b}" for b in BUCKETS]].iloc[0].to_numpy(float)
+            return self._state(), {}
+
+        def step(self, action):
+            row = self.panel.iloc[self.t]
+            w_obs = row[[f"w_{b}" for b in BUCKETS]].to_numpy(float)
+            reg = RegulatoryMap.calibrate(row, w_obs, self.params, target_sum=float(np.sum(self.w)))
+            floors = {"CAR": self.cfg.car_min, "LCR": self.cfg.lcr_min, "NSFR": self.cfg.nsfr_min}
+            mu = (
+                self.yields.iloc[self.t].to_numpy(float)
+                - float(row["rL_avg_interest_bearing_cost_pct"])
+            ) / 100.0
+            lambdas = _action_to_lambdas(action, self.cfg)
+
+            solver_failed = False
+            try:
+                w_new, _, diag = solve_incremental_allocation(
+                    self.w,
+                    float(row["g_asset_growth_q"]),
+                    mu,
+                    self.Sigma,
+                    reg,
+                    self.cfg,
+                    floors,
+                    self.lower,
+                    self.upper,
+                    lambdas,
+                )
+            except Exception:
+                w_new = self.w.copy()
+                solver_failed = True
+                diag = {
+                    "objective": -1.0,
+                    "metrics": reg.metrics(w_new),
+                    "slacks": feasible_slacks(w_new, reg, self.cfg, floors, self.lower, self.upper),
+                    "status": "rl_solver_failure",
+                }
+
+            violation = sum(
+                max(0.0, -float(diag["slacks"].get(k, 0.0)))
+                for k in ("CAR", "LCR", "NSFR", "duration", "trading", "lower_min", "upper_min")
+            )
+            reward = 100.0 * float(diag.get("objective", -1.0)) - 200.0 * violation
+            if solver_failed:
+                reward -= 100.0
+
+            self.w = np.asarray(w_new, float)
+            self.t += 1
+            terminated = self.t >= len(self.panel) - 1
+            truncated = False
+            if terminated:
+                obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+            else:
+                obs = self._state()
+            info = {
+                "lambda_var": lambdas[0],
+                "lambda_cap": lambdas[1],
+                "lambda_liq": lambdas[2],
+                "solver_status": diag.get("status", ""),
+            }
+            return obs, float(reward), terminated, truncated, info
+else:
+    class PenaltyTuneEnv:  # pragma: no cover - dependency error stub
+        def __init__(self, *args, **kwargs):
+            _require_rl()
+
+
+def train_penalty_ppo(
+    panel: pd.DataFrame,
+    params: pd.DataFrame,
+    yields: pd.DataFrame,
+    hard_prob: np.ndarray,
+    Sigma: np.ndarray,
+    cfg: AllocationConfig,
+):
+    _require_cvxpy()
+    _require_rl()
+    env = PenaltyTuneEnv(panel, params, yields, hard_prob, Sigma, cfg)
+    n_steps = int(max(8, min(cfg.ppo_n_steps, max(8, len(panel) - 1))))
+    batch_size = int(max(8, min(cfg.ppo_batch_size, n_steps)))
+    model = PPO(
+        "MlpPolicy",
+        env,
+        learning_rate=cfg.ppo_learning_rate,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        gamma=cfg.ppo_gamma,
+        gae_lambda=cfg.ppo_gae_lambda,
+        clip_range=cfg.ppo_clip_range,
+        ent_coef=cfg.ppo_ent_coef,
+        seed=cfg.seed,
+        verbose=cfg.ppo_verbose,
+        device=cfg.ppo_device,
+        policy_kwargs={"net_arch": [64, 64]},
+    )
+    model.learn(total_timesteps=int(cfg.ppo_timesteps), progress_bar=False)
+    return model
+
+
+def _ppo_lambdas_for_state(
+    model,
+    row: pd.Series,
+    w: np.ndarray,
+    reg: RegulatoryMap,
+    cfg: AllocationConfig,
+    floors: dict[str, float],
+    hard_prob: float,
+    w_lower: np.ndarray,
+    w_upper: np.ndarray,
+) -> tuple[float, float, float]:
+    obs = _rl_observation(row, w, reg, cfg, floors, hard_prob, w_lower, w_upper)
+    action, _ = model.predict(obs, deterministic=True)
+    return _action_to_lambdas(action, cfg)
+
+
+def run_allocation_engine(
+    panel: pd.DataFrame,
+    yc_gov: pd.DataFrame,
+    yc_cred: pd.DataFrame,
+    params: pd.DataFrame,
+    cfg: AllocationConfig,
+) -> dict[str, Any]:
+    """A6 complete formal engine: HMM + Bayesian drift + quantiles + PPO + CVXPY MPC."""
+    _require_cvxpy()
+    if cfg.use_rl:
+        _require_rl()
+
+    # -------------------------
+    # 1) Regime learning (HMM)
+    # -------------------------
+    feats, fnames = build_hmm_features(panel, params)
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(feats)
+    hmm = init_hmm(Xs, 3, cfg.seed)
+    hmm_ll = hmm.em_train(Xs, 50, 1e-4)
+    gamma, xi, _ = hmm.forward_backward(Xs)
+    state_map = map_hmm_regimes(hmm, scaler, fnames)
+    A_bayes = bayes_transition_mean(xi, 1.0)
+    hard_idx = [k for k, v in state_map.items() if v == "hardening"]
+    hard_prob = gamma[:, hard_idx].sum(axis=1) if hard_idx else np.zeros(len(panel))
+
+    # --------------------------------------
+    # 2) Bayesian/Kalman parameter drift
+    # --------------------------------------
+    bayes = dynamic_bayesian_nim_regression(panel, hard_prob) if cfg.use_bayes else None
+
+    # --------------------------------------
+    # 3) Quantile constraint forecasts
+    # --------------------------------------
+    qforecast = (
+        quantile_forecast_latest(
+            panel, yc_gov, gamma,
+            (cfg.q_delta, 0.5, 1.0 - cfg.q_delta),
+            cfg.seed,
+        )
+        if cfg.use_quantile else {}
+    )
+    yields = derive_bucket_yields(panel, yc_gov, yc_cred)
+
+    # --------------------------------------
+    # 4) Risk covariance for robust utility
+    # --------------------------------------
+    Yret = yields.to_numpy(float) / 100.0
+    if len(Yret) > 8:
+        cov = np.cov(np.diff(Yret, axis=0).T)
+    else:
+        cov = np.diag(np.full(len(BUCKETS), 1e-4))
+    cov = _as_psd(cov)
+    lower = np.asarray(cfg.w_lower, float)
+    upper = np.asarray(cfg.w_upper, float)
+
+    # --------------------------------------
+    # 5) Governance-safe PPO penalty tuner
+    # --------------------------------------
+    ppo_model = None
+    if cfg.use_rl:
+        ppo_model = train_penalty_ppo(panel, params, yields, hard_prob, cov, cfg)
+
+    # --------------------------------------
+    # 6) Rolling stock/increment + MPC solve
+    # --------------------------------------
+    rows = []
+    w = panel[[f"w_{b}" for b in BUCKETS]].iloc[0].to_numpy(float)
+
+    for t in range(len(panel)):
+        row = panel.iloc[t]
+        w_obs = row[[f"w_{b}" for b in BUCKETS]].to_numpy(float)
+        reg = RegulatoryMap.calibrate(row, w_obs, params, target_sum=float(np.sum(w)))
+
+        qf = qforecast if t == len(panel) - 1 else None
+        floors = effective_constraint_floors(row, cfg, qf)
+        # If the uncertainty buffer itself makes the feasible set empty, fall
+        # back only to the statutory/management hard floors, not to a different
+        # optimisation method.
+        try:
+            test_anchor, _ = project_to_feasible(w, reg, cfg, floors, lower, upper)
+            if not is_feasible(test_anchor, reg, cfg, floors, lower, upper, 1e-4):
+                raise RuntimeError("chance-buffer infeasible")
+        except Exception:
+            floors = {"CAR": cfg.car_min, "LCR": cfg.lcr_min, "NSFR": cfg.nsfr_min}
+            test_anchor, _ = project_to_feasible(w, reg, cfg, floors, lower, upper)
+            if not is_feasible(test_anchor, reg, cfg, floors, lower, upper, 1e-4):
+                raise RuntimeError(f"A6 hard feasible set is empty at period {row['period']}")
+
+        mu = (
+            yields.iloc[t].to_numpy(float)
+            - float(row["rL_avg_interest_bearing_cost_pct"])
+        ) / 100.0
+        haircut = params.set_index("bucket").loc[BUCKETS, "haircut"].to_numpy(float)
+        y10 = yc_gov[yc_gov["maturity_year"] == 10]["yld_pct"].to_numpy(float)
+        vol = float(np.std(np.diff(y10[: max(t + 1, 2)]))) if t > 1 else 0.0
+        mu = mu - haircut * max(vol, 0.0) / 100.0
+
+        lambdas = (cfg.lambda_var, cfg.lambda_cap, cfg.lambda_liq)
+        if ppo_model is not None:
+            lambdas = _ppo_lambdas_for_state(
+                ppo_model, row, w, reg, cfg, floors, float(hard_prob[t]), lower, upper
+            )
+
+        if cfg.use_mpc and t < len(panel) - 1:
+            H = min(cfg.mpc_horizon, len(panel) - t)
+            growth = panel["g_asset_growth_q"].iloc[t:t + H].to_numpy(float)
+            mus = []
+            for kk in range(H):
+                rr = panel.iloc[t + kk]
+                mui = (
+                    yields.iloc[t + kk].to_numpy(float)
+                    - float(rr["rL_avg_interest_bearing_cost_pct"])
+                ) / 100.0
+                mus.append(mui)
+            w_new, x_inc, diag = solve_mpc_incremental(
+                w, growth, mus, cov, reg, cfg, floors, lower, upper, lambdas
+            )
+        else:
+            w_new, x_inc, diag = solve_incremental_allocation(
+                w, float(row["g_asset_growth_q"]), mu, cov, reg, cfg,
+                floors, lower, upper, lambdas
+            )
+
+        p_controllable = p_explicit = p_hardening = 0.0
         for k in range(3):
-            lab=state_map[k]
-            if lab=="controllable":pcont+=gamma[t,k]
-            elif lab=="explicit":pexp+=gamma[t,k]
-            else:phard+=gamma[t,k]
-        rec={"period":row["period"],"p_controllable":pcont,"p_explicit":pexp,"p_hardening":phard,
-             "regime":max([(pcont,"controllable"),(pexp,"explicit"),(phard,"hardening")])[1],
-             "lambda_var_tuned":lambdas[0],"lambda_cap_tuned":lambdas[1],"lambda_liq_tuned":lambdas[2],
-             "solver_status":diag["status"],"objective":diag["objective"],"growth_share":diag.get("growth_share",np.nan),
-             "CAR_floor":floors["CAR"],"LCR_floor":floors["LCR"],"NSFR_floor":floors["NSFR"]}
-        for i,b in enumerate(BUCKETS): rec[f"w_mpc_{b}"]=float(wn[i]); rec[f"inc_{b}"]=float(xinc[i]); rec[f"mu_{b}"]=float(mu[i])
-        for k,v in diag["metrics"].items():rec[f"metric_{k}"]=float(v)
-        for k,v in diag["slacks"].items():rec[f"slack_{k}"]=float(v)
-        rows.append(rec); w=wn
-    hist=pd.DataFrame(rows)
+            label = state_map[k]
+            if label == "controllable":
+                p_controllable += gamma[t, k]
+            elif label == "explicit":
+                p_explicit += gamma[t, k]
+            else:
+                p_hardening += gamma[t, k]
 
-    # Latest-period deliverable diagnostics: bandwidth, local boundary, shadow prices.
-    t=len(panel)-1; row=panel.iloc[t]; wstar=hist[[f"w_mpc_{b}" for b in BUCKETS]].iloc[-1].to_numpy(float)
-    wprev=hist[[f"w_mpc_{b}" for b in BUCKETS]].iloc[-2].to_numpy(float) if len(hist)>1 else wstar.copy()
-    w_obs=row[[f"w_{b}" for b in BUCKETS]].to_numpy(float); reg=RegulatoryMap.calibrate(row,w_obs,params,target_sum=float(np.sum(wstar))); floors={"CAR":float(hist.iloc[-1]["CAR_floor"]),"LCR":float(hist.iloc[-1]["LCR_floor"]),"NSFR":float(hist.iloc[-1]["NSFR_floor"])}
-    bandwidth=compute_bandwidth(wstar,reg,cfg,floors,lo,hi)
-    mu_latest=hist[[f"mu_{b}" for b in BUCKETS]].iloc[-1].to_numpy(float)
-    shadows=approximate_shadow_prices(wstar,mu_latest,cov,wprev,reg,cfg,floors)
-    eta,bindings=boundary_step(wstar,wstar-wprev,reg,cfg,floors,lo,hi)
-    latest_diag={"eta_max":eta,"binding_report":bindings,"shadow_prices":shadows,"metrics":reg.metrics(wstar),
-                 "slacks":feasible_slacks(wstar,reg,cfg,floors,lo,hi),"feasible":is_feasible(wstar,reg,cfg,floors,lo,hi,1e-3)}
-    return {"history":hist,"bandwidth":bandwidth,"latest_diagnostics":latest_diag,"hmm":hmm,"gamma":gamma,
-            "state_map":state_map,"hmm_loglik":hmm_ll,"bayes_transition":A_bayes,"bayes_nim":bayes,
-            "quantile_forecast":qforecast,"bucket_yields":yields,"penalty_learner":learner}
+        rec = {
+            "period": row["period"],
+            "p_controllable": p_controllable,
+            "p_explicit": p_explicit,
+            "p_hardening": p_hardening,
+            "regime": max([
+                (p_controllable, "controllable"),
+                (p_explicit, "explicit"),
+                (p_hardening, "hardening"),
+            ])[1],
+            "lambda_var_tuned": lambdas[0],
+            "lambda_cap_tuned": lambdas[1],
+            "lambda_liq_tuned": lambdas[2],
+            "solver_status": diag["status"],
+            "objective": diag["objective"],
+            "growth_share": diag.get("growth_share", np.nan),
+            "CAR_floor": floors["CAR"],
+            "LCR_floor": floors["LCR"],
+            "NSFR_floor": floors["NSFR"],
+        }
+        for i, b in enumerate(BUCKETS):
+            rec[f"w_mpc_{b}"] = float(w_new[i])
+            rec[f"inc_{b}"] = float(x_inc[i])
+            rec[f"mu_{b}"] = float(mu[i])
+        for k, v in diag["metrics"].items():
+            rec[f"metric_{k}"] = float(v)
+        for k, v in diag["slacks"].items():
+            rec[f"slack_{k}"] = float(v)
+        for k, v in diag.get("duals", {}).items():
+            rec[f"dual_{k.replace('mu_', '')}"] = float(v)
+        rows.append(rec)
+        w = np.asarray(w_new, float)
 
-# 附录编号统一入口
+    hist = pd.DataFrame(rows)
+
+    # --------------------------------------
+    # 7) Bandwidth, boundary and true duals
+    # --------------------------------------
+    t = len(panel) - 1
+    row = panel.iloc[t]
+    w_star = hist[[f"w_mpc_{b}" for b in BUCKETS]].iloc[-1].to_numpy(float)
+    w_prev = (
+        hist[[f"w_mpc_{b}" for b in BUCKETS]].iloc[-2].to_numpy(float)
+        if len(hist) > 1 else w_star.copy()
+    )
+    w_obs = row[[f"w_{b}" for b in BUCKETS]].to_numpy(float)
+    reg = RegulatoryMap.calibrate(row, w_obs, params, target_sum=float(np.sum(w_star)))
+    floors = {
+        "CAR": float(hist.iloc[-1]["CAR_floor"]),
+        "LCR": float(hist.iloc[-1]["LCR_floor"]),
+        "NSFR": float(hist.iloc[-1]["NSFR_floor"]),
+    }
+    bandwidth = compute_bandwidth(w_star, reg, cfg, floors, lower, upper)
+    eta, bindings = boundary_step(w_star, w_star - w_prev, reg, cfg, floors, lower, upper)
+    shadow_prices = {
+        "mu_CAR": float(hist.iloc[-1].get("dual_CAR", 0.0)),
+        "mu_LCR": float(hist.iloc[-1].get("dual_LCR", 0.0)),
+        "mu_NSFR": float(hist.iloc[-1].get("dual_NSFR", 0.0)),
+        "mu_DURATION": float(hist.iloc[-1].get("dual_DURATION", 0.0)),
+        "mu_TRADING": float(hist.iloc[-1].get("dual_TRADING", 0.0)),
+        "source": "CVXPY_KKT_dual_value",
+    }
+    latest_diag = {
+        "eta_max": eta,
+        "binding_report": bindings,
+        "shadow_prices": shadow_prices,
+        "metrics": reg.metrics(w_star),
+        "slacks": feasible_slacks(w_star, reg, cfg, floors, lower, upper),
+        "feasible": is_feasible(w_star, reg, cfg, floors, lower, upper, 1e-4),
+        "mpc_enabled": bool(cfg.use_mpc),
+        "ppo_enabled": bool(cfg.use_rl),
+        "optimizer": "CVXPY",
+        "preferred_solvers": list(cfg.cvxpy_solvers),
+    }
+
+    return {
+        "history": hist,
+        "bandwidth": bandwidth,
+        "latest_diagnostics": latest_diag,
+        "hmm": hmm,
+        "gamma": gamma,
+        "state_map": state_map,
+        "hmm_loglik": hmm_ll,
+        "bayes_transition": A_bayes,
+        "bayes_nim": bayes,
+        "quantile_forecast": qforecast,
+        "bucket_yields": yields,
+        "ppo_model": ppo_model,
+        "penalty_learner": ppo_model,  # compatibility alias
+    }
+
+
+# Appendix-numbered public entry point
 run_a6 = run_allocation_engine
