@@ -17,34 +17,68 @@ class ThresholdConfig:
 
 @dataclass
 class AllocationConfig:
+    # Hard regulatory / governance floors
     car_min: float = 12.0
     lcr_min: float = 120.0
     nsfr_min: float = 105.0
     duration_cap: float = 4.5
     trading_cap: float = 0.15
-    # Broad governance bands inherited from the user's original full-stack code.
+
+    # Six-bucket governance bands
     w_lower: tuple[float, ...] = (0.15, 0.10, 0.02, 0.00, 0.02, 0.02)
     w_upper: tuple[float, ...] = (0.70, 0.55, 0.25, 0.15, 0.20, 0.25)
+
+    # Base penalty coefficients. PPO may tune only the first three.
     lambda_var: float = 0.35
     lambda_cap: float = 0.50
     lambda_liq: float = 0.50
     lambda_turn: float = 0.10
     kappa_lcr: float = 1.0
     kappa_nsfr: float = 1.0
-    capital_shadow_base: float = 1.0
+    capital_shadow_base: float = 0.02
+    liquidity_shadow_base: float = 0.02
+
+    # Safety buffers above hard regulatory floors
     safety_car_margin: float = 0.25
     safety_lcr_margin: float = 5.0
     safety_nsfr_margin: float = 1.5
+
+    # MPC settings
     discount: float = 0.97
     mpc_horizon: int = 4
-    use_mpc: bool = False
+    use_mpc: bool = True
+
+    # Model switches (for ablation / robustness tests)
     use_hmm: bool = True
     use_bayes: bool = True
     use_quantile: bool = True
-    use_rl: bool = False
+    use_rl: bool = True
+
+    # Quantile and bandwidth settings
     q_delta: float = 0.10
-    bandwidth_rho: float = 0.10
-    solver_maxiter: int = 500
+    bandwidth_rho: float = 1e-4
+
+    # CVXPY / solver settings
+    cvxpy_solvers: tuple[str, ...] = ("OSQP", "ECOS")
+    solver_maxiter: int = 20000
+    solver_eps_abs: float = 1e-7
+    solver_eps_rel: float = 1e-7
+    solver_verbose: bool = False
+
+    # PPO settings. PPO actions tune lambda_var/lambda_cap/lambda_liq only.
+    ppo_timesteps: int = 1000
+    ppo_n_steps: int = 64
+    ppo_batch_size: int = 64
+    ppo_learning_rate: float = 3e-4
+    ppo_gamma: float = 0.95
+    ppo_gae_lambda: float = 0.95
+    ppo_clip_range: float = 0.20
+    ppo_ent_coef: float = 0.0
+    ppo_lambda_min_mult: float = 0.50
+    ppo_lambda_max_mult: float = 2.00
+    ppo_verbose: int = 0
+    ppo_device: str = "auto"
+
     seed: int = 2026
 
 
