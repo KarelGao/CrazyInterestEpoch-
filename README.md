@@ -18,8 +18,7 @@ Python 建议版本：3.10 或更高。
 pip install -r requirements_bank_allocation.txt
 ```
 
-核心版本不依赖 `cvxpy`、`gymnasium` 或 `stable-baselines3`。配置求解使用 `scipy.optimize.SLSQP`；强化学习部分采用治理安全的离散 Q-learning，只调节风险/资本/流动性惩罚权重，不直接生成资产权重。
-
+A6 核心配置模块采用 CVXPY 构建多期约束 MPC，并使用 OSQP/ECOS 完成凸优化求解；强化学习模块基于 Gymnasium 与 Stable-Baselines3 的 PPO 实现，仅用于动态校准风险、资本与流动性惩罚参数，不直接生成资产配置权重。MPC 与 RL 可通过模块开关进行消融或稳健性检验，但完整模型默认启用。
 ## 3. 最简运行
 
 ```bash
