@@ -6,7 +6,7 @@
 
 # NIM-State Robust Allocation Research System（A1—A10）
 
-本程序将《伪代码.docx》中的 A1—A10 算法严格按编号拆分为十个 Python 模块，并复用、重构原有 `main.py`、`main02.py`、`main03.py` 的数据生成、HMM、机器学习、MPC、PPO 和输出逻辑。
+本程序中的 A1—A10 算法严格按编号拆分为十个 Python 模块，并复用、重构数据生成、HMM、机器学习、MPC、PPO 和输出逻辑。
 
 ## 1. 工程结构
 
