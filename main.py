@@ -114,10 +114,17 @@ def run_system(cfg: SystemConfig, force_generate: bool = True):
 
     print("[A6] NIM-State Robust 核心资产配置")
     a6 = run_a6(panel, yc_gov, yc_cred, params, cfg.allocation)
+    # Formal A6 deliverables. Keep compatibility aliases for older drafts.
+    a6["history"].to_csv(outdir/"A6_allocation_path.csv",index=False,encoding="utf-8-sig")
     a6["history"].to_csv(outdir/"A6_allocation_history.csv",index=False,encoding="utf-8-sig")
+    a6["bandwidth"].to_csv(outdir/"A6_bandwidth_latest.csv",index=False,encoding="utf-8-sig")
     a6["bandwidth"].to_csv(outdir/"A6_latest_bandwidth.csv",index=False,encoding="utf-8-sig")
+    pd.DataFrame(a6["bayes_transition"]).to_csv(outdir/"A6_hmm_transition.csv",index=False,encoding="utf-8-sig")
+    _write_json(outdir/"A6_shadow_prices_latest.json", a6["latest_diagnostics"]["shadow_prices"])
     _write_json(outdir/"A6_latest_diagnostics.json", a6["latest_diagnostics"])
     _write_json(outdir/"A6_model_diagnostics.json", {"hmm_loglik":a6["hmm_loglik"],"state_map":a6["state_map"],"bayes_transition":a6["bayes_transition"],"quantile_forecast":a6["quantile_forecast"]})
+    if a6.get("ppo_model") is not None:
+        a6["ppo_model"].save(str(outdir/"A6_ppo_penalty_tuner"))
 
     print("[A7] 外部利率阶段识别 + NIM 内部校准")
     a7 = run_a7(panel, yc_gov, cfg.stage)
@@ -158,13 +165,14 @@ def run_system(cfg: SystemConfig, force_generate: bool = True):
 
 
 def parse_args():
-    p=argparse.ArgumentParser(description="A1-A10 modular NIM-State Robust Allocation System")
+    p=argparse.ArgumentParser(description="A1-A10 formal NIM-State Robust Allocation System")
     p.add_argument("--out-dir",default="./system_outputs")
     p.add_argument("--sim-dir",default="./sim_data")
-    p.add_argument("--full",action="store_true")
+    p.add_argument("--full",action="store_true",help="research-grade settings: larger bootstrap and PPO training")
     p.add_argument("--bootstrap",type=int,default=None)
-    p.add_argument("--mpc",action="store_true")
-    p.add_argument("--rl",action="store_true")
+    p.add_argument("--ppo-timesteps",type=int,default=None)
+    p.add_argument("--no-mpc",action="store_true",help="ablation only: disable multi-period MPC and use one-step CVXPY solve")
+    p.add_argument("--no-rl",action="store_true",help="ablation only: disable PPO penalty tuning")
     p.add_argument("--reuse-data",action="store_true")
     return p.parse_args()
 
@@ -172,9 +180,16 @@ def parse_args():
 def main():
     args=parse_args()
     cfg=SystemConfig(out_dir=args.out_dir,sim_dir=args.sim_dir,fast_mode=not args.full)
-    if args.bootstrap is not None: cfg.threshold.bootstrap_B=max(19,args.bootstrap)
-    elif args.full: cfg.threshold.bootstrap_B=999
-    cfg.allocation.use_mpc=bool(args.mpc); cfg.allocation.use_rl=bool(args.rl)
+    if args.bootstrap is not None:
+        cfg.threshold.bootstrap_B=max(19,args.bootstrap)
+    elif args.full:
+        cfg.threshold.bootstrap_B=999
+    cfg.allocation.use_mpc=not bool(args.no_mpc)
+    cfg.allocation.use_rl=not bool(args.no_rl)
+    if args.ppo_timesteps is not None:
+        cfg.allocation.ppo_timesteps=max(64,args.ppo_timesteps)
+    elif args.full:
+        cfg.allocation.ppo_timesteps=10000
     print("[SYSTEM] 按附录顺序运行：A1 → A2 → A3 → A4 → A5 → A6 → A7 → A8 → A9 → A10")
     result=run_system(cfg,force_generate=not args.reuse_data)
     print("[SYSTEM] 完成：",Path(cfg.out_dir).resolve())
