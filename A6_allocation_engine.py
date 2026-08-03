@@ -27,14 +27,948 @@ except Exception:
     gym = None
     PPO = None
     RL_OK = False
+
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+    TORCH_OK = True
+except Exception:
+    torch = None
+    nn = None
+    DataLoader = None
+    TensorDataset = None
+    TORCH_OK = False
+
 from common import BUCKETS, BUCKET_CN
 from config import ThresholdConfig, AllocationConfig, StageConfig, SystemConfig
-from A3_shadow_rate import _interpolate_curve
+
 
 """A6 NIM-State Robust 核心资产配置算法
 
 与附录算法编号一一对应。主要入口：run_allocation_engine。
+
+新增模块
+--------
+Conditional WGAN-GP 仅生成市场联合情景，并将情景映射为六类资产的
+收益分位数与协方差。资产权重仍由原有 CVXPY / MPC 在硬约束内求解。
 """
+
+
+def _interpolate_curve(row: np.ndarray, maturities: np.ndarray) -> np.ndarray:
+    """A6 本地曲线插值，避免依赖 A3 的私有函数。
+
+    为保持原 A6 的行为，单个有效点时使用常数外推；全部缺失时返回零向量。
+    实际生产数据应在进入 A6 前完成数据质量校验，避免使用全缺失曲线。
+    """
+    row = np.asarray(row, float).copy()
+    maturities = np.asarray(maturities, float)
+    ok = np.isfinite(row)
+    if np.sum(ok) == 0:
+        return np.zeros_like(row)
+    if np.sum(ok) == 1:
+        row[:] = row[ok][0]
+        return row
+    row[~ok] = np.interp(maturities[~ok], maturities[ok], row[ok])
+    return row
+
+
+DEFAULT_GAN_MARKET_COLUMNS = (
+    "Repo7D_pct",
+    "DR007_pct",
+    "R007_pct",
+    "LPR1_pct",
+    "LPR5_pct",
+    "gov_1y_pct",
+    "gov_3y_pct",
+    "gov_5y_pct",
+    "gov_10y_pct",
+    "credit_3y_pct",
+    "credit_5y_pct",
+    "NCD_3m_pct",
+    "credit_spread_pct",
+    "repo_spread_pct",
+    "market_volatility",
+)
+
+
+@dataclass
+class GANSpec:
+    """条件 WGAN-GP 情景模块参数。
+
+    这些参数优先从 AllocationConfig 的同名字段读取。原 config.py 尚未加入
+    对应字段时，A6 会使用这里的默认值，因此 use_gan=False 时保持完全兼容。
+    """
+
+    use_gan: bool = False
+    market_columns: tuple[str, ...] = ()
+    path_length: int = 60
+    n_scenarios: int = 500
+    noise_dim: int = 32
+    hidden_dim: int = 96
+    batch_size: int = 64
+    epochs: int = 300
+    critic_steps: int = 5
+    gp_lambda: float = 10.0
+    learning_rate: float = 1e-4
+    stress_ratio: float = 0.30
+    history_weight: float = 0.70
+    min_windows: int = 64
+    level_margin_iqr: float = 4.0
+    change_margin_iqr: float = 3.0
+    device: str = "cpu"
+    seed: int = 0
+
+    @classmethod
+    def from_cfg(cls, cfg: AllocationConfig) -> "GANSpec":
+        columns = getattr(cfg, "gan_market_columns", ())
+        if columns is None:
+            columns = ()
+        return cls(
+            use_gan=bool(getattr(cfg, "use_gan", False)),
+            market_columns=tuple(columns),
+            path_length=int(getattr(cfg, "gan_path_length", 60)),
+            n_scenarios=int(getattr(cfg, "gan_n_scenarios", 500)),
+            noise_dim=int(getattr(cfg, "gan_noise_dim", 32)),
+            hidden_dim=int(getattr(cfg, "gan_hidden_dim", 96)),
+            batch_size=int(getattr(cfg, "gan_batch_size", 64)),
+            epochs=int(getattr(cfg, "gan_epochs", 300)),
+            critic_steps=int(getattr(cfg, "gan_critic_steps", 5)),
+            gp_lambda=float(getattr(cfg, "gan_gp_lambda", 10.0)),
+            learning_rate=float(getattr(cfg, "gan_learning_rate", 1e-4)),
+            stress_ratio=float(getattr(cfg, "gan_stress_ratio", 0.30)),
+            history_weight=float(getattr(cfg, "gan_history_weight", 0.70)),
+            min_windows=int(getattr(cfg, "gan_min_windows", 64)),
+            level_margin_iqr=float(getattr(cfg, "gan_level_margin_iqr", 4.0)),
+            change_margin_iqr=float(getattr(cfg, "gan_change_margin_iqr", 3.0)),
+            device=str(getattr(cfg, "gan_device", "cpu")),
+            seed=int(getattr(cfg, "seed", 0)),
+        )
+
+    def validate(self) -> None:
+        if self.path_length < 2:
+            raise ValueError("gan_path_length must be at least 2")
+        if self.n_scenarios < 1:
+            raise ValueError("gan_n_scenarios must be positive")
+        if self.noise_dim < 1 or self.hidden_dim < 4:
+            raise ValueError("invalid GAN network dimensions")
+        if self.batch_size < 2:
+            raise ValueError("gan_batch_size must be at least 2")
+        if self.epochs < 1 or self.critic_steps < 1:
+            raise ValueError("gan_epochs and gan_critic_steps must be positive")
+        if not 0.0 <= self.stress_ratio <= 1.0:
+            raise ValueError("gan_stress_ratio must lie in [0, 1]")
+        if not 0.0 <= self.history_weight <= 1.0:
+            raise ValueError("gan_history_weight must lie in [0, 1]")
+
+
+@dataclass
+class GANBundle:
+    generator: Any
+    critic: Any
+    change_scaler: StandardScaler
+    condition_scaler: StandardScaler
+    market_columns: list[str]
+    condition_columns: list[str]
+    last_level: np.ndarray
+    level_bounds: np.ndarray
+    change_bounds: np.ndarray
+    real_levels: np.ndarray
+    device: str
+    train_diagnostics: dict[str, Any]
+
+
+def _require_gan() -> None:
+    if not TORCH_OK:
+        raise ImportError(
+            "A6 GAN module requires PyTorch. Install with: pip install torch"
+        )
+
+
+def _normalise_period_value(value: Any) -> str:
+    """Convert dates and common quarter labels to a comparable YYYYQn key."""
+    if isinstance(value, pd.Period):
+        try:
+            return str(value.asfreq("Q"))
+        except Exception:
+            return str(value)
+    s = str(value).strip()
+    upper = s.upper().replace("-", "").replace("_", "")
+    if "Q" in upper:
+        parts = upper.split("Q", 1)
+        try:
+            return f"{int(parts[0]):04d}Q{int(parts[1][0])}"
+        except Exception:
+            pass
+    try:
+        return str(pd.Timestamp(value).to_period("Q"))
+    except Exception:
+        return s
+
+
+def _normalise_period_series(values: Sequence[Any]) -> pd.Series:
+    return pd.Series([_normalise_period_value(v) for v in values], dtype="object")
+
+
+def _regime_probability_frame(
+    panel: pd.DataFrame,
+    gamma: np.ndarray,
+    state_map: dict[int, str],
+    cfg: AllocationConfig,
+) -> pd.DataFrame:
+    rows: list[dict[str, float | str]] = []
+    gamma = np.asarray(gamma, float)
+    if len(panel) != len(gamma):
+        raise ValueError("panel and HMM gamma length mismatch")
+    for t in range(len(panel)):
+        probs = {"controllable": 0.0, "explicit": 0.0, "hardening": 0.0}
+        for k in range(gamma.shape[1]):
+            probs[state_map.get(k, "hardening")] += float(gamma[t, k])
+        row = panel.iloc[t]
+        rows.append({
+            "period_key": _normalise_period_value(row["period"]),
+            "p_controllable": probs["controllable"],
+            "p_explicit": probs["explicit"],
+            "p_hardening": probs["hardening"],
+            "lpr_level": float(row.get("LPR1_pct", 0.0)),
+            "car_slack": float(row.get("CAR_pct", cfg.car_min)) - float(cfg.car_min),
+            "lcr_slack": float(row.get("LCR_pct", cfg.lcr_min)) - float(cfg.lcr_min),
+            "nsfr_slack": float(row.get("NSFR_pct", cfg.nsfr_min)) - float(cfg.nsfr_min),
+        })
+    return pd.DataFrame(rows).drop_duplicates("period_key", keep="last")
+
+
+def _daily_condition_frame(
+    daily_market: pd.DataFrame,
+    panel: pd.DataFrame,
+    gamma: np.ndarray,
+    state_map: dict[int, str],
+    cfg: AllocationConfig,
+) -> tuple[pd.DataFrame, list[str]]:
+    daily = daily_market.copy()
+    if "date" in daily.columns:
+        daily = daily.sort_values("date").reset_index(drop=True)
+    if "period" in daily.columns:
+        daily["period_key"] = _normalise_period_series(daily["period"])
+    elif "date" in daily.columns:
+        daily["period_key"] = _normalise_period_series(daily["date"])
+    else:
+        raise ValueError("daily_market must contain 'date' or 'period'")
+
+    regime = _regime_probability_frame(panel, gamma, state_map, cfg)
+    condition_columns = [
+        "p_controllable",
+        "p_explicit",
+        "p_hardening",
+        "lpr_level",
+        "car_slack",
+        "lcr_slack",
+        "nsfr_slack",
+    ]
+    merged = daily[["period_key"]].merge(regime, how="left", on="period_key")
+    merged[condition_columns] = (
+        merged[condition_columns]
+        .apply(pd.to_numeric, errors="coerce")
+        .ffill()
+        .bfill()
+    )
+    if merged[condition_columns].isna().any().any():
+        latest = regime.iloc[-1][condition_columns].to_numpy(float)
+        for j, col in enumerate(condition_columns):
+            merged[col] = merged[col].fillna(float(latest[j]))
+    return merged[condition_columns], condition_columns
+
+
+def _select_gan_market_columns(
+    daily_market: pd.DataFrame,
+    spec: GANSpec,
+) -> list[str]:
+    requested = list(spec.market_columns) if spec.market_columns else list(DEFAULT_GAN_MARKET_COLUMNS)
+    columns = [c for c in requested if c in daily_market.columns]
+    if not columns:
+        numeric = daily_market.select_dtypes(include=[np.number]).columns.tolist()
+        columns = [c for c in numeric if c.lower() not in {"year", "quarter", "month", "day"}]
+    if not columns:
+        raise ValueError("daily_market contains no usable numeric market variables")
+    return columns
+
+
+def _robust_bounds(
+    X: np.ndarray,
+    margin_iqr: float,
+) -> np.ndarray:
+    X = np.asarray(X, float)
+    q001 = np.nanquantile(X, 0.001, axis=0)
+    q999 = np.nanquantile(X, 0.999, axis=0)
+    q25 = np.nanquantile(X, 0.25, axis=0)
+    q75 = np.nanquantile(X, 0.75, axis=0)
+    iqr = np.maximum(q75 - q25, 1e-8)
+    return np.column_stack([
+        q001 - margin_iqr * iqr,
+        q999 + margin_iqr * iqr,
+    ])
+
+
+def build_gan_training_windows(
+    daily_market: pd.DataFrame,
+    panel: pd.DataFrame,
+    gamma: np.ndarray,
+    state_map: dict[int, str],
+    cfg: AllocationConfig,
+    spec: GANSpec,
+) -> dict[str, Any]:
+    """Build standardised daily-change paths and regime/constraint conditions."""
+    spec.validate()
+    daily = daily_market.copy()
+    if "date" in daily.columns:
+        daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
+        daily = daily.sort_values("date").reset_index(drop=True)
+
+    market_columns = _select_gan_market_columns(daily, spec)
+    levels_df = daily[market_columns].apply(pd.to_numeric, errors="coerce")
+    levels_df = levels_df.interpolate(limit_direction="both").ffill().bfill()
+    if levels_df.isna().any().any():
+        bad = levels_df.columns[levels_df.isna().any()].tolist()
+        raise ValueError(f"GAN market columns remain missing after interpolation: {bad}")
+
+    conditions_df, condition_columns = _daily_condition_frame(
+        daily, panel, gamma, state_map, cfg
+    )
+    levels = levels_df.to_numpy(float)
+    conditions = conditions_df.to_numpy(float)
+    if len(levels) <= spec.path_length + 1:
+        raise ValueError(
+            f"daily_market has {len(levels)} rows; more than "
+            f"gan_path_length+1={spec.path_length + 1} are required"
+        )
+
+    changes = np.diff(levels, axis=0)
+    change_scaler = StandardScaler()
+    condition_scaler = StandardScaler()
+    changes_z = change_scaler.fit_transform(changes)
+    conditions_z = condition_scaler.fit_transform(conditions[:-1])
+
+    windows: list[np.ndarray] = []
+    window_conditions: list[np.ndarray] = []
+    max_start = len(changes_z) - spec.path_length + 1
+    for start in range(max_start):
+        windows.append(changes_z[start:start + spec.path_length])
+        window_conditions.append(conditions_z[start])
+
+    if len(windows) < spec.min_windows:
+        raise ValueError(
+            f"only {len(windows)} GAN windows are available; "
+            f"gan_min_windows={spec.min_windows}"
+        )
+
+    level_bounds = _robust_bounds(levels, spec.level_margin_iqr)
+    change_bounds = _robust_bounds(changes, spec.change_margin_iqr)
+
+    latest_condition = conditions[-1].copy()
+    stress_condition = latest_condition.copy()
+    cidx = {name: i for i, name in enumerate(condition_columns)}
+    stress_condition[cidx["p_controllable"]] = 0.0
+    stress_condition[cidx["p_explicit"]] = 0.0
+    stress_condition[cidx["p_hardening"]] = 1.0
+    for name in ("car_slack", "lcr_slack", "nsfr_slack", "lpr_level"):
+        j = cidx[name]
+        stress_condition[j] = min(
+            stress_condition[j],
+            float(np.nanquantile(conditions[:, j], 0.10)),
+        )
+
+    return {
+        "windows": np.asarray(windows, dtype=np.float32),
+        "conditions": np.asarray(window_conditions, dtype=np.float32),
+        "market_columns": market_columns,
+        "condition_columns": condition_columns,
+        "change_scaler": change_scaler,
+        "condition_scaler": condition_scaler,
+        "last_level": levels[-1].copy(),
+        "level_bounds": level_bounds,
+        "change_bounds": change_bounds,
+        "real_levels": levels,
+        "latest_condition": latest_condition,
+        "stress_condition": stress_condition,
+    }
+
+
+if TORCH_OK:
+    class ConditionalPathGenerator(nn.Module):
+        """GRU generator for a complete multivariate daily-change path."""
+
+        def __init__(
+            self,
+            noise_dim: int,
+            condition_dim: int,
+            hidden_dim: int,
+            n_vars: int,
+            path_length: int,
+        ):
+            super().__init__()
+            self.noise_dim = int(noise_dim)
+            self.condition_dim = int(condition_dim)
+            self.hidden_dim = int(hidden_dim)
+            self.n_vars = int(n_vars)
+            self.path_length = int(path_length)
+            self.init_hidden = nn.Sequential(
+                nn.Linear(noise_dim + condition_dim, hidden_dim),
+                nn.Tanh(),
+            )
+            self.position = nn.Parameter(
+                torch.randn(path_length, hidden_dim // 4) * 0.02
+            )
+            self.gru = nn.GRU(
+                input_size=condition_dim + hidden_dim // 4,
+                hidden_size=hidden_dim,
+                batch_first=True,
+            )
+            self.output = nn.Linear(hidden_dim, n_vars)
+
+        def forward(self, noise, condition):
+            batch = noise.shape[0]
+            h0 = self.init_hidden(torch.cat([noise, condition], dim=1)).unsqueeze(0)
+            cond_seq = condition.unsqueeze(1).expand(batch, self.path_length, self.condition_dim)
+            pos = self.position.unsqueeze(0).expand(batch, self.path_length, -1)
+            seq, _ = self.gru(torch.cat([cond_seq, pos], dim=2), h0)
+            return self.output(seq)
+
+
+    class ConditionalPathCritic(nn.Module):
+        """GRU Wasserstein critic conditioned on the same state vector."""
+
+        def __init__(
+            self,
+            condition_dim: int,
+            hidden_dim: int,
+            n_vars: int,
+        ):
+            super().__init__()
+            self.gru = nn.GRU(
+                input_size=n_vars + condition_dim,
+                hidden_size=hidden_dim,
+                batch_first=True,
+                bidirectional=True,
+            )
+            self.head = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.LeakyReLU(0.2),
+                nn.Linear(hidden_dim, 1),
+            )
+
+        def forward(self, path, condition):
+            cond_seq = condition.unsqueeze(1).expand(-1, path.shape[1], -1)
+            _, hidden = self.gru(torch.cat([path, cond_seq], dim=2))
+            h = torch.cat([hidden[-2], hidden[-1]], dim=1)
+            return self.head(h).reshape(-1)
+else:
+    class ConditionalPathGenerator:  # pragma: no cover
+        def __init__(self, *args, **kwargs):
+            _require_gan()
+
+
+    class ConditionalPathCritic:  # pragma: no cover
+        def __init__(self, *args, **kwargs):
+            _require_gan()
+
+
+def _gan_device(spec: GANSpec) -> str:
+    _require_gan()
+    requested = spec.device.lower()
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        warnings.warn("CUDA requested for GAN but unavailable; falling back to CPU")
+        return "cpu"
+    return requested
+
+
+def _gradient_penalty(
+    critic,
+    real_path,
+    fake_path,
+    condition,
+) -> Any:
+    batch = real_path.shape[0]
+    eps = torch.rand(batch, 1, 1, device=real_path.device)
+    mixed = eps * real_path + (1.0 - eps) * fake_path
+    mixed.requires_grad_(True)
+    score = critic(mixed, condition)
+    grad = torch.autograd.grad(
+        outputs=score,
+        inputs=mixed,
+        grad_outputs=torch.ones_like(score),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    grad = grad.reshape(batch, -1)
+    return ((grad.norm(2, dim=1) - 1.0) ** 2).mean()
+
+
+def train_conditional_wgan_gp(
+    prepared: dict[str, Any],
+    spec: GANSpec,
+) -> GANBundle:
+    """Train conditional WGAN-GP on standardised daily changes."""
+    _require_gan()
+    spec.validate()
+    np.random.seed(spec.seed)
+    torch.manual_seed(spec.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(spec.seed)
+
+    device = _gan_device(spec)
+    windows = torch.as_tensor(prepared["windows"], dtype=torch.float32)
+    conditions = torch.as_tensor(prepared["conditions"], dtype=torch.float32)
+    dataset = TensorDataset(windows, conditions)
+    loader = DataLoader(
+        dataset,
+        batch_size=min(spec.batch_size, len(dataset)),
+        shuffle=True,
+        drop_last=False,
+        generator=torch.Generator().manual_seed(spec.seed),
+    )
+
+    n_vars = windows.shape[2]
+    condition_dim = conditions.shape[1]
+    generator = ConditionalPathGenerator(
+        spec.noise_dim,
+        condition_dim,
+        spec.hidden_dim,
+        n_vars,
+        spec.path_length,
+    ).to(device)
+    critic = ConditionalPathCritic(
+        condition_dim,
+        spec.hidden_dim,
+        n_vars,
+    ).to(device)
+
+    opt_g = torch.optim.Adam(
+        generator.parameters(),
+        lr=spec.learning_rate,
+        betas=(0.0, 0.9),
+    )
+    opt_c = torch.optim.Adam(
+        critic.parameters(),
+        lr=spec.learning_rate,
+        betas=(0.0, 0.9),
+    )
+
+    history: list[dict[str, float]] = []
+    for epoch in range(spec.epochs):
+        critic_losses: list[float] = []
+        generator_losses: list[float] = []
+        for real_path, condition in loader:
+            real_path = real_path.to(device)
+            condition = condition.to(device)
+            batch = real_path.shape[0]
+
+            for _ in range(spec.critic_steps):
+                noise = torch.randn(batch, spec.noise_dim, device=device)
+                fake_path = generator(noise, condition).detach()
+                critic_real = critic(real_path, condition).mean()
+                critic_fake = critic(fake_path, condition).mean()
+                gp = _gradient_penalty(
+                    critic,
+                    real_path,
+                    fake_path,
+                    condition,
+                )
+                loss_c = critic_fake - critic_real + spec.gp_lambda * gp
+                opt_c.zero_grad(set_to_none=True)
+                loss_c.backward()
+                opt_c.step()
+                critic_losses.append(float(loss_c.detach().cpu()))
+
+            noise = torch.randn(batch, spec.noise_dim, device=device)
+            fake_path = generator(noise, condition)
+            loss_g = -critic(fake_path, condition).mean()
+            opt_g.zero_grad(set_to_none=True)
+            loss_g.backward()
+            opt_g.step()
+            generator_losses.append(float(loss_g.detach().cpu()))
+
+        history.append({
+            "epoch": float(epoch + 1),
+            "critic_loss": float(np.mean(critic_losses)),
+            "generator_loss": float(np.mean(generator_losses)),
+        })
+
+    diagnostics = {
+        "n_windows": int(len(dataset)),
+        "path_length": int(spec.path_length),
+        "n_market_variables": int(n_vars),
+        "epochs": int(spec.epochs),
+        "final_critic_loss": history[-1]["critic_loss"],
+        "final_generator_loss": history[-1]["generator_loss"],
+        "loss_history": history,
+        "device": device,
+    }
+    return GANBundle(
+        generator=generator,
+        critic=critic,
+        change_scaler=prepared["change_scaler"],
+        condition_scaler=prepared["condition_scaler"],
+        market_columns=list(prepared["market_columns"]),
+        condition_columns=list(prepared["condition_columns"]),
+        last_level=np.asarray(prepared["last_level"], float),
+        level_bounds=np.asarray(prepared["level_bounds"], float),
+        change_bounds=np.asarray(prepared["change_bounds"], float),
+        real_levels=np.asarray(prepared["real_levels"], float),
+        device=device,
+        train_diagnostics=diagnostics,
+    )
+
+
+def _generate_path_block(
+    bundle: GANBundle,
+    condition_raw: np.ndarray,
+    n_paths: int,
+    spec: GANSpec,
+) -> np.ndarray:
+    if n_paths <= 0:
+        return np.empty((0, spec.path_length, len(bundle.market_columns)), float)
+    condition_z = bundle.condition_scaler.transform(
+        np.asarray(condition_raw, float).reshape(1, -1)
+    )[0]
+    out: list[np.ndarray] = []
+    bundle.generator.eval()
+    with torch.no_grad():
+        remaining = int(n_paths)
+        batch_limit = max(1, min(spec.batch_size * 4, n_paths))
+        while remaining > 0:
+            batch = min(batch_limit, remaining)
+            cond = torch.as_tensor(
+                np.repeat(condition_z[None, :], batch, axis=0),
+                dtype=torch.float32,
+                device=bundle.device,
+            )
+            noise = torch.randn(
+                batch,
+                spec.noise_dim,
+                device=bundle.device,
+            )
+            fake_z = bundle.generator(noise, cond).cpu().numpy()
+            fake_changes = bundle.change_scaler.inverse_transform(
+                fake_z.reshape(-1, fake_z.shape[-1])
+            ).reshape(fake_z.shape)
+            levels = bundle.last_level[None, None, :] + np.cumsum(
+                fake_changes,
+                axis=1,
+            )
+            out.append(levels)
+            remaining -= batch
+    return np.concatenate(out, axis=0)
+
+
+def generate_gan_scenarios(
+    bundle: GANBundle,
+    latest_condition: np.ndarray,
+    stress_condition: np.ndarray,
+    spec: GANSpec,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate a mixture of current-state and pressure-state paths."""
+    n_stress = int(round(spec.n_scenarios * spec.stress_ratio))
+    n_base = spec.n_scenarios - n_stress
+    base = _generate_path_block(bundle, latest_condition, n_base, spec)
+    stress = _generate_path_block(bundle, stress_condition, n_stress, spec)
+    scenarios = np.concatenate([base, stress], axis=0)
+    stress_flag = np.r_[
+        np.zeros(len(base), dtype=bool),
+        np.ones(len(stress), dtype=bool),
+    ]
+    rng = np.random.default_rng(spec.seed)
+    order = rng.permutation(len(scenarios))
+    return scenarios[order], stress_flag[order]
+
+
+def validate_and_project_gan_scenarios(
+    scenarios: np.ndarray,
+    bundle: GANBundle,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Project extreme numerical paths into broad historical admissible bounds.
+
+    No upward-sloping yield-curve restriction is imposed. Yield curves may be
+    flat or inverted. The checks only constrain implausible levels, one-day
+    changes, non-finite values, and variables that are structurally nonnegative
+    such as spreads and volatility.
+    """
+    raw = np.asarray(scenarios, float)
+    if raw.ndim != 3:
+        raise ValueError("GAN scenarios must have shape [scenario, horizon, variable]")
+    out = np.nan_to_num(
+        raw,
+        nan=np.nan,
+        posinf=np.nan,
+        neginf=np.nan,
+    )
+    n, horizon, n_vars = out.shape
+    level_lo = bundle.level_bounds[:, 0]
+    level_hi = bundle.level_bounds[:, 1]
+    change_lo = bundle.change_bounds[:, 0]
+    change_hi = bundle.change_bounds[:, 1]
+    prev = np.repeat(bundle.last_level[None, :], n, axis=0)
+
+    changed = np.zeros_like(out, dtype=bool)
+    for h in range(horizon):
+        current = out[:, h, :]
+        bad = ~np.isfinite(current)
+        current[bad] = np.broadcast_to(prev, current.shape)[bad]
+        delta = current - prev
+        clipped_delta = np.clip(delta, change_lo, change_hi)
+        projected = np.clip(prev + clipped_delta, level_lo, level_hi)
+
+        for j, name in enumerate(bundle.market_columns):
+            lower_name = name.lower()
+            if any(token in lower_name for token in ("spread", "vol", "variance")):
+                projected[:, j] = np.maximum(projected[:, j], 0.0)
+
+        changed[:, h, :] = np.abs(projected - raw[:, h, :]) > 1e-12
+        out[:, h, :] = projected
+        prev = projected
+
+    scenario_changed = changed.any(axis=(1, 2))
+    diagnostics = {
+        "scenario_count": int(n),
+        "untouched_scenario_rate": float(np.mean(~scenario_changed)),
+        "projected_scenario_rate": float(np.mean(scenario_changed)),
+        "projected_cell_rate": float(np.mean(changed)),
+        "all_finite_after_projection": bool(np.isfinite(out).all()),
+    }
+    return out, diagnostics
+
+
+def _lag1_autocorrelation(x: np.ndarray) -> float:
+    x = np.asarray(x, float)
+    if len(x) < 3 or np.nanstd(x[:-1]) < 1e-12 or np.nanstd(x[1:]) < 1e-12:
+        return float("nan")
+    return float(np.corrcoef(x[:-1], x[1:])[0, 1])
+
+
+def gan_quality_diagnostics(
+    bundle: GANBundle,
+    scenarios: np.ndarray,
+) -> pd.DataFrame:
+    """Compare real and generated marginal moments and average lag-1 dependence."""
+    rows: list[dict[str, Any]] = []
+    real = bundle.real_levels
+    for j, name in enumerate(bundle.market_columns):
+        generated = scenarios[:, :, j]
+        generated_flat = generated.reshape(-1)
+        generated_ac = [
+            _lag1_autocorrelation(generated[i, :])
+            for i in range(len(generated))
+        ]
+        rows.append({
+            "variable": name,
+            "real_mean": float(np.mean(real[:, j])),
+            "generated_mean": float(np.mean(generated_flat)),
+            "real_std": float(np.std(real[:, j])),
+            "generated_std": float(np.std(generated_flat)),
+            "real_q01": float(np.quantile(real[:, j], 0.01)),
+            "generated_q01": float(np.quantile(generated_flat, 0.01)),
+            "real_q99": float(np.quantile(real[:, j], 0.99)),
+            "generated_q99": float(np.quantile(generated_flat, 0.99)),
+            "real_lag1": _lag1_autocorrelation(real[:, j]),
+            "generated_lag1_mean": float(np.nanmean(generated_ac)),
+        })
+    return pd.DataFrame(rows)
+
+
+_SCENARIO_ALIASES = {
+    "LPR1_pct": ("LPR1_pct", "LPR1", "LPR_1Y", "lpr1"),
+    "LPR5_pct": ("LPR5_pct", "LPR5", "LPR_5Y", "lpr5"),
+    "DR007_pct": ("DR007_pct", "DR007", "dr007"),
+    "gov5_pct": ("gov_5y_pct", "gov5_pct", "gov5", "CGB5Y_pct"),
+    "gov10_pct": ("gov_10y_pct", "gov10_pct", "gov10", "CGB10Y_pct"),
+    "cred3_pct": ("credit_3y_pct", "cred3_pct", "cred3"),
+    "cred5_pct": ("credit_5y_pct", "cred5_pct", "cred5"),
+}
+
+
+def _scenario_variable(
+    scenarios: np.ndarray,
+    market_columns: Sequence[str],
+    aliases: Sequence[str],
+    fallback: float,
+) -> np.ndarray:
+    lookup = {str(c).lower(): i for i, c in enumerate(market_columns)}
+    for name in aliases:
+        if name.lower() in lookup:
+            return scenarios[:, :, lookup[name.lower()]]
+    return np.full(scenarios.shape[:2], float(fallback))
+
+
+def _latest_curve_point(
+    curve: pd.DataFrame,
+    maturity: float,
+    latest_period: Any,
+) -> float:
+    if len(curve) == 0:
+        return 0.0
+    subset = curve[curve["period"].astype(str) == str(latest_period)]
+    if subset.empty:
+        last_period = curve["period"].iloc[-1]
+        subset = curve[curve["period"] == last_period]
+    mats = subset["maturity_year"].to_numpy(float)
+    vals = subset["yld_pct"].to_numpy(float)
+    order = np.argsort(mats)
+    mats = mats[order]
+    vals = _interpolate_curve(vals[order], mats)
+    return float(np.interp(float(maturity), mats, vals))
+
+
+def map_market_scenarios_to_bucket_returns(
+    scenarios: np.ndarray,
+    market_columns: Sequence[str],
+    panel_row: pd.Series,
+    yc_gov: pd.DataFrame,
+    yc_cred: pd.DataFrame,
+) -> np.ndarray:
+    """Map generated market paths to six-bucket excess-return paths.
+
+    The mapping deliberately reuses derive_bucket_yields() economic coefficients
+    so the GAN module does not create a second, conflicting asset-pricing layer.
+    """
+    latest_period = panel_row["period"]
+    fallback = {
+        "LPR1_pct": float(panel_row["LPR1_pct"]),
+        "LPR5_pct": float(panel_row["LPR5_pct"]),
+        "DR007_pct": float(panel_row["DR007_pct"]),
+        "gov5_pct": _latest_curve_point(yc_gov, 5.0, latest_period),
+        "gov10_pct": _latest_curve_point(yc_gov, 10.0, latest_period),
+        "cred3_pct": _latest_curve_point(yc_cred, 3.0, latest_period),
+        "cred5_pct": _latest_curve_point(yc_cred, 5.0, latest_period),
+    }
+    values = {
+        key: _scenario_variable(
+            scenarios,
+            market_columns,
+            _SCENARIO_ALIASES[key],
+            fallback[key],
+        )
+        for key in fallback
+    }
+    L1 = values["LPR1_pct"]
+    L5 = values["LPR5_pct"]
+    dr = values["DR007_pct"]
+    gov5 = values["gov5_pct"]
+    gov10 = values["gov10_pct"]
+    cred3 = values["cred3_pct"]
+    cred5 = values["cred5_pct"]
+
+    bucket_yields = np.stack([
+        0.92 * L1 + 0.10 * L5 - 0.25,
+        0.55 * cred5 + 0.45 * gov10 + 0.15,
+        dr + 0.20,
+        0.55 * cred3 + 0.25 * dr + 0.20 * gov5 + 0.10,
+        0.80 * gov5 + 0.10,
+        0.55 * cred5 + 0.25 * L1 + 0.20 * gov5 + 0.35,
+    ], axis=2)
+    funding_cost = float(panel_row["rL_avg_interest_bearing_cost_pct"])
+    return (bucket_yields - funding_cost) / 100.0
+
+
+def summarize_gan_bucket_returns(
+    bucket_returns: np.ndarray,
+    q_delta: float,
+) -> dict[str, Any]:
+    """Use scenario-level path averages to avoid treating every generated day
+    as an independent statistical observation.
+    """
+    R = np.asarray(bucket_returns, float)
+    if R.ndim != 3 or R.shape[2] != len(BUCKETS):
+        raise ValueError("bucket_returns must be [scenario, horizon, six buckets]")
+    path_average = np.mean(R, axis=1)
+    mu_tail = np.quantile(path_average, float(q_delta), axis=0)
+    mu_median = np.quantile(path_average, 0.50, axis=0)
+    covariance = (
+        np.cov(path_average.T)
+        if len(path_average) > 1
+        else np.diag(np.full(len(BUCKETS), 1e-8))
+    )
+    mu_path = np.quantile(R, float(q_delta), axis=0)
+    return {
+        "path_average_returns": path_average,
+        "mu_tail": np.asarray(mu_tail, float),
+        "mu_median": np.asarray(mu_median, float),
+        "covariance": _as_psd(covariance),
+        "mu_path": np.asarray(mu_path, float),
+    }
+
+
+def run_gan_scenario_module(
+    daily_market: pd.DataFrame,
+    panel: pd.DataFrame,
+    gamma: np.ndarray,
+    state_map: dict[int, str],
+    yc_gov: pd.DataFrame,
+    yc_cred: pd.DataFrame,
+    cfg: AllocationConfig,
+) -> dict[str, Any]:
+    """Train, generate, validate and map conditional GAN scenarios."""
+    spec = GANSpec.from_cfg(cfg)
+    if not spec.use_gan:
+        return {
+            "enabled": False,
+            "spec": spec,
+            "bundle": None,
+            "scenarios": None,
+            "stress_flag": None,
+            "bucket_returns": None,
+            "summary": None,
+            "diagnostics": {},
+        }
+    if daily_market is None:
+        raise ValueError("daily_market is required when cfg.use_gan=True")
+
+    prepared = build_gan_training_windows(
+        daily_market,
+        panel,
+        gamma,
+        state_map,
+        cfg,
+        spec,
+    )
+    bundle = train_conditional_wgan_gp(prepared, spec)
+    raw_scenarios, stress_flag = generate_gan_scenarios(
+        bundle,
+        prepared["latest_condition"],
+        prepared["stress_condition"],
+        spec,
+    )
+    scenarios, validation = validate_and_project_gan_scenarios(
+        raw_scenarios,
+        bundle,
+    )
+    quality = gan_quality_diagnostics(bundle, scenarios)
+    bucket_returns = map_market_scenarios_to_bucket_returns(
+        scenarios,
+        bundle.market_columns,
+        panel.iloc[-1],
+        yc_gov,
+        yc_cred,
+    )
+    summary = summarize_gan_bucket_returns(
+        bucket_returns,
+        float(getattr(cfg, "q_delta", 0.10)),
+    )
+    diagnostics = {
+        "training": bundle.train_diagnostics,
+        "validation": validation,
+        "quality": quality,
+        "stress_scenario_share": float(np.mean(stress_flag)),
+    }
+    return {
+        "enabled": True,
+        "spec": spec,
+        "bundle": bundle,
+        "scenarios": scenarios,
+        "stress_flag": stress_flag,
+        "bucket_returns": bucket_returns,
+        "summary": summary,
+        "diagnostics": diagnostics,
+    }
 
 @dataclass
 class GaussianHMM:
@@ -1081,8 +2015,16 @@ def run_allocation_engine(
     yc_cred: pd.DataFrame,
     params: pd.DataFrame,
     cfg: AllocationConfig,
+    daily_market: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
-    """A6 complete formal engine: HMM + Bayesian drift + quantiles + PPO + CVXPY MPC."""
+    """A6 formal engine.
+
+    Original modules remain unchanged: HMM + Bayesian drift + quantiles +
+    governance-safe PPO + CVXPY/MPC.  When cfg.use_gan=True, a conditional
+    WGAN-GP scenario layer is inserted after HMM and its return/risk statistics
+    are blended only into the latest live allocation step. Historical rolling
+    rows retain the original point-in-time logic.
+    """
     _require_cvxpy()
     if cfg.use_rl:
         _require_rl()
@@ -1102,12 +2044,34 @@ def run_allocation_engine(
     hard_prob = gamma[:, hard_idx].sum(axis=1) if hard_idx else np.zeros(len(panel))
 
     # --------------------------------------
-    # 2) Bayesian/Kalman parameter drift
+    # 2) Conditional GAN scenario expansion
+    # --------------------------------------
+    gan_result = run_gan_scenario_module(
+        daily_market,
+        panel,
+        gamma,
+        state_map,
+        yc_gov,
+        yc_cred,
+        cfg,
+    ) if bool(getattr(cfg, "use_gan", False)) else {
+        "enabled": False,
+        "spec": GANSpec.from_cfg(cfg),
+        "bundle": None,
+        "scenarios": None,
+        "stress_flag": None,
+        "bucket_returns": None,
+        "summary": None,
+        "diagnostics": {},
+    }
+
+    # --------------------------------------
+    # 3) Bayesian/Kalman parameter drift
     # --------------------------------------
     bayes = dynamic_bayesian_nim_regression(panel, hard_prob) if cfg.use_bayes else None
 
     # --------------------------------------
-    # 3) Quantile constraint forecasts
+    # 4) Quantile constraint forecasts
     # --------------------------------------
     qforecast = (
         quantile_forecast_latest(
@@ -1120,7 +2084,7 @@ def run_allocation_engine(
     yields = derive_bucket_yields(panel, yc_gov, yc_cred)
 
     # --------------------------------------
-    # 4) Risk covariance for robust utility
+    # 5) Risk covariance for robust utility
     # --------------------------------------
     Yret = yields.to_numpy(float) / 100.0
     if len(Yret) > 8:
@@ -1132,14 +2096,14 @@ def run_allocation_engine(
     upper = np.asarray(cfg.w_upper, float)
 
     # --------------------------------------
-    # 5) Governance-safe PPO penalty tuner
+    # 6) Governance-safe PPO penalty tuner
     # --------------------------------------
     ppo_model = None
     if cfg.use_rl:
         ppo_model = train_penalty_ppo(panel, params, yields, hard_prob, cov, cfg)
 
     # --------------------------------------
-    # 6) Rolling stock/increment + MPC solve
+    # 7) Rolling stock/increment + MPC solve
     # --------------------------------------
     rows = []
     w = panel[[f"w_{b}" for b in BUCKETS]].iloc[0].to_numpy(float)
@@ -1172,6 +2136,28 @@ def run_allocation_engine(
         y10 = yc_gov[yc_gov["maturity_year"] == 10]["yld_pct"].to_numpy(float)
         vol = float(np.std(np.diff(y10[: max(t + 1, 2)]))) if t > 1 else 0.0
         mu = mu - haircut * max(vol, 0.0) / 100.0
+        cov_step = cov
+
+        # GAN is a scenario layer only.  It does not output weights or alter
+        # hard regulatory constraints.  To avoid look-ahead in the historical
+        # rolling path, generated statistics are blended only at the latest row.
+        if gan_result["enabled"] and t == len(panel) - 1:
+            gan_summary = gan_result["summary"]
+            history_weight = float(gan_result["spec"].history_weight)
+            mu = (
+                history_weight * mu
+                + (1.0 - history_weight) * np.asarray(
+                    gan_summary["mu_tail"],
+                    float,
+                )
+            )
+            cov_step = _as_psd(
+                history_weight * cov
+                + (1.0 - history_weight) * np.asarray(
+                    gan_summary["covariance"],
+                    float,
+                )
+            )
 
         lambdas = (cfg.lambda_var, cfg.lambda_cap, cfg.lambda_liq)
         if ppo_model is not None:
@@ -1191,11 +2177,11 @@ def run_allocation_engine(
                 ) / 100.0
                 mus.append(mui)
             w_new, x_inc, diag = solve_mpc_incremental(
-                w, growth, mus, cov, reg, cfg, floors, lower, upper, lambdas
+                w, growth, mus, cov_step, reg, cfg, floors, lower, upper, lambdas
             )
         else:
             w_new, x_inc, diag = solve_incremental_allocation(
-                w, float(row["g_asset_growth_q"]), mu, cov, reg, cfg,
+                w, float(row["g_asset_growth_q"]), mu, cov_step, reg, cfg,
                 floors, lower, upper, lambdas
             )
 
@@ -1245,7 +2231,7 @@ def run_allocation_engine(
     hist = pd.DataFrame(rows)
 
     # --------------------------------------
-    # 7) Bandwidth, boundary and true duals
+    # 8) Bandwidth, boundary and true duals
     # --------------------------------------
     t = len(panel) - 1
     row = panel.iloc[t]
@@ -1280,6 +2266,19 @@ def run_allocation_engine(
         "feasible": is_feasible(w_star, reg, cfg, floors, lower, upper, 1e-4),
         "mpc_enabled": bool(cfg.use_mpc),
         "ppo_enabled": bool(cfg.use_rl),
+        "gan_enabled": bool(gan_result["enabled"]),
+        "gan_scenario_count": (
+            int(len(gan_result["scenarios"]))
+            if gan_result["enabled"] else 0
+        ),
+        "gan_stress_scenario_share": (
+            float(np.mean(gan_result["stress_flag"]))
+            if gan_result["enabled"] else 0.0
+        ),
+        "gan_projected_scenario_rate": (
+            float(gan_result["diagnostics"]["validation"]["projected_scenario_rate"])
+            if gan_result["enabled"] else 0.0
+        ),
         "optimizer": "CVXPY",
         "preferred_solvers": list(cfg.cvxpy_solvers),
     }
@@ -1296,6 +2295,20 @@ def run_allocation_engine(
         "bayes_nim": bayes,
         "quantile_forecast": qforecast,
         "bucket_yields": yields,
+        "gan_enabled": bool(gan_result["enabled"]),
+        "gan_model": (
+            gan_result["bundle"].generator
+            if gan_result["enabled"] else None
+        ),
+        "gan_critic": (
+            gan_result["bundle"].critic
+            if gan_result["enabled"] else None
+        ),
+        "gan_scenarios": gan_result["scenarios"],
+        "gan_stress_flag": gan_result["stress_flag"],
+        "gan_bucket_returns": gan_result["bucket_returns"],
+        "gan_summary": gan_result["summary"],
+        "gan_diagnostics": gan_result["diagnostics"],
         "ppo_model": ppo_model,
         "penalty_learner": ppo_model,  # compatibility alias
     }
