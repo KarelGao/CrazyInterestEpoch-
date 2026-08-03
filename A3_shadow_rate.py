@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
-1. 中国国债零息收益率曲线 -> 固定期限远期利率；
-2. 现实概率测度 P 与风险中性测度 Q 下的状态动态；
-3. 影子短端 s_t = delta0 + delta1' X_t；
-4. 有效利率下限进入全部期限的 Wu–Xia 非线性定价；
-5. 扩展 Kalman 滤波与 RTS 平滑；
-6. FixParam / MLE / RollingMLE；
-7. 输出影子利率、名义短端、下限约束概率、置信区间及拟合诊断。
+#1. 中国国债零息收益率曲线 -> 固定期限远期利率；
+#2. 现实概率测度 P 与风险中性测度 Q 下的状态动态；
+#3. 影子短端 s_t = delta0 + delta1' X_t；
+#4. 有效利率下限进入全部期限的 Wu–Xia 非线性定价；
+#5. 扩展 Kalman 滤波与 RTS 平滑；
+#6. FixParam / MLE / RollingMLE；
+#7. 输出影子利率、名义短端、下限约束概率、置信区间及拟合诊断。
 
-说明：
-- Nelson–Siegel 仅用于参数与状态初始化，不参与最终 Wu–Xia 定价。
-- 默认 MLE 使用稳定性较高的对角 AP/AQ、Cholesky Sigma 和对角 R。
-- CurveControls 仅作为可选测量修正项，不改变核心影子短端定义。
-"""
+#说明：
+#- Nelson–Siegel 仅用于参数与状态初始化，不参与最终 Wu–Xia 定价。
+#- 默认 MLE 使用稳定性较高的对角 AP/AQ、Cholesky Sigma 和对角 R。
+#- CurveControls 仅作为可选测量修正项，不改变核心影子短端定义。
+#"""
 
 from __future__ import annotations
 
