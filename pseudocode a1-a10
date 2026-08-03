@@ -1,0 +1,1675 @@
+附录 A 算法清单
+A1 门槛回归模型及显著性检验算法（Hansen 单门槛模型、Bootstrap 显著性检验与置信区间构造）
+(
+Input:
+y_t        : 被解释变量序列（长度 T）
+X_t        : 解释变量矩阵（T×k，含控制变量；是否含常数项由口径决定）
+q_t        : 门槛变量序列（长度 T）
+τ          : trimming ratio（例如 0.05/0.10）
+B          : Bootstrap 重复次数（例如 1000/2000）
+αList      : 显著性水平集合（如 {0.10, 0.05, 0.01}）
+FEflag     : 固定效应口径开关（"none" / "time" / "entity" / "twoway"）
+id_t       : 个体索引（若为面板；时间序列则置空）
+time_t     : 时间索引（若为面板；时间序列则置空）
+BootType   : 自助法类型（"residual" / "wild"）
+GridType   : 候选门槛集合构造方式（"uniqueQ" / "quantileGrid"）
+Output:
+γHat           : 门槛点估计
+CIγ[α]         : 门槛点置信区间（每个 α 一条区间）
+SupFobs        : 观测样本 sup-F
+pValue         : Bootstrap p-value
+CritSupF[α]    : Bootstrap 临界值
+Decision1      : 单门槛显著性结论
+Decision2      : 顺序检验下“双门槛是否显著”的结论)
+STEP 0. 数据对齐与固定效应处理口径
+T = Length[y];
+(0.1 缺失值处理：y、X、q 按同期对齐，任一变量缺失时删除对应观测。 *)
+KeepIndex = Select[Range[T], (NumericQ[y[[#]]] && VectorQ[X[[#]]] && NumericQ[q[[#]]]) &];
+y0 = y[[KeepIndex]];
+X0 = X[[KeepIndex]];
+q0 = q[[KeepIndex]];
+T0 = Length[y0];
+(0.2 固定效应变换必须作用于实际回归设计矩阵。)
+(门槛模型中先构造 X*I(q≤γ) 与 X*I(q>γ)，再对分段变量执行固定效应投影；)
+(不能先对X去均值后再乘门槛指示变量。非平衡双向固定效应采用迭代投影或虚拟变量吸收。)
+WithinDemean[v_, group_] := Module[{g = group, mu}, mu = Association@Map[# -> Mean[Pick[v, g, #]] &, DeleteDuplicates[g]];
+v - (mu /@ g)];
+TwoWayDemean[v_, id_, time_] := FixedPoint[WithinDemean[WithinDemean[#, id], time] &, v, SameTest -> (Max[Abs[#1-#2]] < 10^-10 &)];
+ApplyFE[{yIn_, XIn_}] := Module[{yFE = yIn, XFE = XIn}, If[FEflag == "none", Return[{yFE, XFE}]];
+If[FEflag == "time",
+yFE = WithinDemean[yFE, time_t[[KeepIndex]]];
+XFE = Map[WithinDemean[#, time_t[[KeepIndex]]] &, Transpose[XFE]] // Transpose;
+];
+If[FEflag == "entity",
+yFE = WithinDemean[yFE, id_t[[KeepIndex]]];
+XFE = Map[WithinDemean[#, id_t[[KeepIndex]]] &, Transpose[XFE]] // Transpose;
+];
+If[FEflag == "twoway",
+yFE = TwoWayDemean[yFE, id_t[[KeepIndex]], time_t[[KeepIndex]]];
+XFE = Map[TwoWayDemean[#, id_t[[KeepIndex]], time_t[[KeepIndex]]] &, Transpose[XFE]] // Transpose;
+];
+{yFE, XFE}];
+{yFE, XFE} = ApplyFE[{y0, X0}];
+k = Dimensions[XFE][[2]];     (解释变量个数)
+STEP 1. trimming 与候选门槛集合 Γ
+qSorted = Sort[q0];
+qLow  = Quantile[qSorted, τ];
+qHigh = Quantile[qSorted, 1 - τ];
+(1.1 候选集合：每段样本量不低于 τ*T0。)
+If[GridType == "uniqueQ",
+Γ = Select[DeleteDuplicates[q0], (qLow <= # <= qHigh) &];
+];
+If[GridType == "quantileGrid",
+(用分位点网格可控制候选数量，避免 q 取值过密导致搜索过慢)
+Γ = Table[Quantile[qSorted, p], {p, τ, 1 - τ, 0.001}];
+Γ = DeleteDuplicates[Γ];
+];
+STEP 2. 给定 γ 的分段回归与 RSS(γ)
+(2.1 先构造原始分段设计矩阵，再进行固定效应变换。)
+BuildZ[γ_] := Module[{I1, I2, Zraw, yTemp, ZFE}, I1 = Boole[q0 <= γ];
+I2 = 1 - I1;
+Zraw = Join[MapThread[#1*#2 &, {X0, I1}], MapThread[#1*#2 &, {X0, I2}], 2];
+{yTemp, ZFE} = ApplyFE[{y0, Zraw}];
+ZFE];
+(2.2 OLS：β̂(γ) 与 RSS(γ))
+OLS_RSS[Z_, yVec_] := Module[{b, resid, RSS}, b = LeastSquares[Z, yVec];
+resid = yVec - Z.b;
+RSS = Total[resid^2];
+{RSS, b, resid}];
+(2.3 门槛搜索：逐点求 RSS)
+RSSList = Table[Module[{Z = BuildZ[γ], out}, out = OLS_RSS[Z, yFE];
+{γ, out[[1]], out[[2]]}        ({γ, RSS(γ), β̂(γ)})
+],
+{γ, Γ}];
+γHat  = First[MinimalBy[RSSList, #[[2]] &]][[1]];
+RSSHat = First[Select[RSSList, #[[1]] == γHat &]][[2]];
+σHat2  = RSSHat/(T0 - 2*k);        (两段系数合计 2k 个参数)
+STEP 3. 无门槛模型 RSS0 与 F(γ) / supF
+(3.1 无门槛：y = Xβ + u （同样在 FE 处理后的 yFE, XFE 上回归）)
+{RSS0, β0, uHat} = OLS_RSS[XFE, yFE];
+(3.2 Hansen sup-F：对每个 γ 计算 F(γ)，取最大值)
+FStat[RSSγ_] := ((RSS0 - RSSγ)/k) / (RSSγ/(T0 - 2*k));
+SupFobs = Max[ FStat /@ (RSSList[[All, 2]]) ];
+STEP 4. Bootstrap（在 H0 下生成 y*）并得到临界值与 p-value
+(4.1 H0 下生成：y* = Xβ0 + u*；u* 用 residual bootstrap 或 wild bootstrap)
+GenUStar[u_] := Module[{Tn = Length[u]}, If[BootType == "residual", Return[RandomChoice[u, Tn]];                (残差重抽样)];
+If[BootType == "wild",
+(wild bootstrap 保持异方差稳健性；Rademacher 权重常用)
+Return[u * RandomChoice[{-1, 1}, Tn]];
+];
+];
+(4.2 每次自助：重复“门槛搜索+supF”)
+OneBootstrapSupF[] := Module[{uStar, yStar, yStarFE, RSSListStar, SupFStar, RSS0Star, u0Star},
+uStar = GenUStar[uHat];
+yStar = XFE.β0 + uStar;
+(若固定效应是先 within 再回归，则 yStar 已在 FE 空间；否则需与原口径一致处理)
+yStarFE = yStar;
+(无门槛 RSS0*)
+{RSS0Star, _, u0Star} = OLS_RSS[XFE, yStarFE];
+(门槛搜索 RSS*(γ))
+RSSListStar = Table[Module[{Z = BuildZ[γ], out}, out = OLS_RSS[Z, yStarFE];
+out[[1]]                              (只取 RSS*(γ))
+],
+{γ, Γ}];
+SupFStar = Max[ ((RSS0Star - #)/k) / (#/(T0 - 2*k)) & /@ RSSListStar ];
+SupFStar];
+SupFBoot = Table[OneBootstrapSupF[], {b, 1, B}];
+(4.3 临界值与 p-value)
+CritSupF = Association@Table[α -> Quantile[SupFBoot, 1 - α], {α, αList}];
+pValue   = Mean[Boole[SupFBoot >= SupFobs]];
+αDecision = If[MemberQ[αList, 0.05], 0.05, Max[αList]];  Decision1 = If[pValue < αDecision, "单门槛显著", "单门槛不显著"];
+STEP 5. 门槛点置信区间：LR 反演（critical value 从 Bootstrap 给）
+(5.1 计算 LR(γ))
+LRList = Table[Module[{RSSγ = RSSList[[i, 2]], γ = RSSList[[i, 1]]}, {γ, (RSSγ - RSSHat)/σHat2}], {i, 1, Length[RSSList]}];
+(5.2 c_α 的来源：用“Bootstrap 门槛点分布”或“Bootstrap LR 分布”给临界值
+置信区间采用每次 bootstrap 内 LR*(γ) 上确界的经验分布；
+这里给出可复现的实现：用 supLR* 的分位点作为 c_α。)
+ZHat = BuildZ[γHat];
+{_, βHatThreshold, uHatThreshold} = OLS_RSS[ZHat, yFE];
+OneBootstrapSupLR[] := Module[{uStar, yStar, RSSStarList, RSSStarHat, σStar2, LRStarSup},
+uStar = GenUStar[uHatThreshold];
+yStar = ZHat.βHatThreshold + uStar;
+RSSStarList = Table[Module[{Z = BuildZ[γ], out}, out = OLS_RSS[Z, yStar]; {γ, out[[1]]}],
+{γ, Γ}];
+RSSStarHat = Min[RSSStarList[[All,2]]];
+σStar2 = RSSStarHat/(T0 - 2*k);
+LRStarSup = Max[(RSSStarList[[All,2]] - RSSStarHat)/σStar2];
+LRStarSup];
+SupLRBoot = Table[OneBootstrapSupLR[], {b, 1, B}];
+CritLR = Association@Table[α -> Quantile[SupLRBoot, 1 - α], {α, αList}];
+(5.3 反演区间：CIγ(α) = {γ | LR(γ) ≤ c_α})
+CIγ = Association@Table[α -> Module[{c = CritLR[α], ok}, ok = Select[LRList, #[[2]] <= c &][[All, 1]];
+{Min[ok], Max[ok]}
+],
+{α, αList}];
+STEP 6. 顺序双门槛检验（可选）：只在单门槛显著时执行
+Decision2 = "未执行双门槛检验";
+If[Decision1 == "单门槛显著",
+(双门槛属于“在两段内再加一次”，顺序检验的统计量是：
+SupF2 = sup_{γ2} [RSS(γ̂1) - RSS(γ̂1,γ2)] 的增量版本； 临界值同样用 Bootstrap。下面写出可复现的增量检验框架。)
+(6.1 在固定 γ1=γHat 下，构造双门槛候选 γ2（可分别在两段内搜索，这里示意全局搜索）)
+BuildZ2[γ1_, γ2_] := Module[{I1, I2, I3, Zraw, yTemp, ZFE}, I1 = Boole[q0 <= Min[γ1, γ2]];
+I3 = Boole[q0 > Max[γ1, γ2]];
+I2 = 1 - I1 - I3;
+Zraw = Join[MapThread[#1*#2 &, {X0, I1}], MapThread[#1*#2 &, {X0, I2}], MapThread[#1*#2 &, {X0, I3}], 2];
+{yTemp, ZFE} = ApplyFE[{y0, Zraw}];
+ZFE];
+(6.2 在 γ1 固定下，搜索 γ2 使 RSS 最小)
+RSS1 = RSSHat;   (单门槛最小 RSS)
+RSS2List = Table[Module[{Z = BuildZ2[γHat, γ2], out}, out = OLS_RSS[Z, yFE];
+{γ2, out[[1]]}
+],
+{γ2, Γ}];
+RSS2Hat = Min[RSS2List[[All, 2]]];
+(6.3 增量 supF2：以“从2段到3段”的参数增加量为约束个数)
+dfAdd = k;  (从2段到3段，多出一段系数，相当于增加 k 个参数)
+F2obs = ((RSS1 - RSS2Hat)/dfAdd) / (RSS2Hat/(T0 - 3*k));
+(6.4 Bootstrap 增量检验：在 H0(只有单门槛) 下生成 y*，重复搜索 γ2 并得到 F2* 分布)
+GenUnderSingleThreshold[] := Module[{Z1, b1, resid1, uStar, yStar}, Z1 = BuildZ[γHat];
+{_, b1, resid1} = OLS_RSS[Z1, yFE];     (单门槛下残差)
+uStar = If[BootType == "wild", resid1*RandomChoice[{-1,1}, Length[resid1]], RandomChoice[resid1, Length[resid1]]];
+yStar = Z1.b1 + uStar;                  (在“单门槛为真”下生成 y*)
+yStar];
+OneBootstrapF2[] := Module[{yStar, RSS1StarList, γ1Star, RSS1StarHat, RSS2StarHat}, yStar = GenUnderSingleThreshold[];
+RSS1StarList = Table[Module[{Z = BuildZ[γ], out}, out = OLS_RSS[Z, yStar]; {γ, out[[1]]}],
+{γ, Γ}];
+γ1Star = First[MinimalBy[RSS1StarList, Last]][[1]];
+RSS1StarHat = Min[RSS1StarList[[All,2]]];
+RSS2StarHat = Min@Table[Module[{Z = BuildZ2[γ1Star, γ2], out}, out = OLS_RSS[Z, yStar]; out[[1]]],
+{γ2, Γ}];
+((RSS1StarHat - RSS2StarHat)/dfAdd)/(RSS2StarHat/(T0 - 3*k))];
+F2Boot = Table[OneBootstrapF2[], {b, 1, B}];
+pValue2 = Mean[Boole[F2Boot >= F2obs]];
+Decision2 = If[pValue2 < 0.05, "双门槛显著", "双门槛不显著（顺序检验下停止）"];
+];
+OUTPUT PACK
+Result = <|
+"gammaHat" -> γHat,
+"CIgamma"  -> CIγ,
+"SupFobs"  -> SupFobs,
+"pValue"   -> pValue,
+"CritSupF" -> CritSupF,
+"Decision1"-> Decision1,
+"Decision2"-> Decision2|>;
+A2 Granger 因果关系检验算法（全样本与低利率阶段子样本的比较检验）
+(
+Input:
+data          : 按真实时间顺序排列的数据表
+x_t           : 变量 x（如1Y LPR或DR007）
+y_t           : 变量 y（如NIM）
+stage_t       : 阶段标签（每期一个标签："Enter" / "Visible" / "Deep"）
+pMax          : 最大滞后阶数候选（不得超过有效样本允许范围）
+ICtype        : 信息准则（"BIC" / "AIC"）
+TransformRule : 平稳化处理规则（"level" / "diff" / "logdiff" / 自定义函数）
+AllowStageLag : 阶段子样本是否单独构造滞后（仅在该阶段为单一连续区间时允许）
+SigList       : 显著性水平集合（默认 {0.10,0.05,0.01}）
+Output:
+ResultTable   : Group × Direction × LagOrder × F × pValue × Sig × SampleFlag)
+STEP 0. 定义样本组与连续区间检查
+GroupSet = {"Full", "Enter", "Visible", "Deep"};
+SelectGroup[g_] := If[g == "Full", Range[Length[x_t]], Flatten@Position[stage_t, g]];
+ContiguousQ[idx_] := If[Length[idx] <= 1, True, And @@ Thread[Differences[idx] == 1]];
+STEP 1. 序列变换及时间标签对齐
+ApplyTransform[s_, rule_] := Module[{out, offset}, If[rule == "level",   out = s;                 offset = 0];
+If[rule == "diff",    out = Differences[s];    offset = 1]; If[rule == "logdiff", out = Differences[Log[s]]; offset = 1]; If[Head[rule] === Function, {out, offset} = rule[s]]; <|
+"series" -> out,
+"offset" -> offset|>];
+STEP 2. 共同有效样本上的滞后矩阵
+AlignXY[x_, y_, p_, pBase_] := Module[{Tn, tIdx, yDep, yLag, xLag}, Tn = Min[Length[x], Length[y]];
+tIdx = Range[pBase + 1, Tn];
+yDep = y[[tIdx]];
+yLag = Transpose@Table[y[[tIdx - k]], {k, 1, p}];
+xLag = Transpose@Table[x[[tIdx - k]], {k, 1, p}];
+<|"tIdx"->tIdx, "yDep"->yDep, "yLag"->yLag, "xLag"->xLag|>];
+STEP 3. OLS、RSS与F检验
+OLS_RSS[Z_, yDep_] := Module[{b, resid, rss}, b = LeastSquares[Z, yDep];
+resid = yDep - Z.b;
+rss = Total[resid^2];
+{rss, b, resid}];
+FtestFromRSS[RSSR_, RSSU_, q_, df2_] := ((RSSR - RSSU)/q)/(RSSU/df2);
+STEP 4. 滞后阶数选择（所有候选阶数使用同一有效样本）
+InfoCriterion[RSS_, T_eff_, k_eff_, type_] := Module[{ic}, If[type == "AIC", ic = Log[RSS/T_eff] + 2*k_eff/T_eff];
+If[type == "BIC", ic = Log[RSS/T_eff] + Log[T_eff]*k_eff/T_eff]; ic]; ChooseLag[x_, y_, pMax_, ICtype_] := Module[{p, pack, ZU, rss, Teff, kEff, icList}, icList = Table[pack = AlignXY[x, y, p, pMax]; Teff = Length[pack["yDep"]]; ZU = Join[ConstantArray[{1}, Teff], pack["yLag"], pack["xLag"], 2]; rss = OLS_RSS[ZU, pack["yDep"]][[1]]; kEff = Dimensions[ZU][[2]]; {p, InfoCriterion[rss, Teff, kEff, ICtype]},
+{p, 1, pMax}];
+First[MinimalBy[icList, Last]][[1]]];
+STEP 5. 单方向Granger检验
+GrangerOneDirection[x_, y_, p_] := Module[{pack, Teff, ZU, ZR, RSSU, RSSR, df1, df2, Fstat, pval}, pack = AlignXY[x, y, p, p];
+Teff = Length[pack["yDep"]];
+If[Teff <= 2*p + 1, Return[<|"SampleFlag"->"Insufficient"|>]]; ZU = Join[ConstantArray[{1}, Teff], pack["yLag"], pack["xLag"], 2]; ZR = Join[ConstantArray[{1}, Teff], pack["yLag"], 2]; RSSU = OLS_RSS[ZU, pack["yDep"]][[1]]; RSSR = OLS_RSS[ZR, pack["yDep"]][[1]]; df1 = p; df2 = Teff - Dimensions[ZU][[2]]; Fstat = FtestFromRSS[RSSR, RSSU, df1, df2]; pval = 1 - CDF[FRatioDistribution[df1, df2], Fstat]; <|"p"->p, "F"->Fstat, "pValue"->pval, "SampleFlag"->"OK"|>]; SigMark[pval_] := Which[pval < 0.01, "***", pval < 0.05, "**", pval < 0.10, "*", True, ""];
+STEP 6. 全样本变换与阶段标签同步
+xPack = ApplyTransform[x_t, TransformRule];
+yPack = ApplyTransform[y_t, TransformRule];
+offset = Max[xPack["offset"], yPack["offset"]];
+Tmin = Min[Length[xPack["series"]], Length[yPack["series"]]];
+xFull = xPack["series"][[1 ;; Tmin]];
+yFull = yPack["series"][[1 ;; Tmin]];
+stageFull = stage_t[[1 + offset ;; offset + Tmin]];
+];
+<|"p"->p, "F"->Fstat, "pValue"->pval, "SampleFlag"->"OK"|>
+pval = 1 - CDF[FRatioDistribution[df1, df2], Fstat];
+Fstat = FtestFromRSS[RSSR, RSSU, df1, df2];
+df1 = p; df2 = Teff - Dimensions[ZU][[2]];
+RSSR = OLS_RSS[ZR, yDep][[1]];
+RSSU = OLS_RSS[ZU, yDep][[1]];
+ZR = Join[ConstantArray[{1}, Teff], yLag, 2];
+ZU = Join[ConstantArray[{1}, Teff], yLag, xLag, 2];
+xLag = pack["xLag"][[slice]];
+yLag = pack["yLag"][[slice]];
+yDep = pack["yDep"][[slice]];
+If[Teff <= 2*p + 1, Return[<|
+"p"->p,
+"SampleFlag"->"Insufficient"
+|>]]; Teff = Length[slice]; slice = Select[Range[Length[pack["tIdx"]]], stage[[pack["tIdx"][[#]]]] == g &]; pack = AlignXY[x, y, p, p]; {pack, slice, yDep, yLag, xLag, Teff, ZU, ZR, RSSU, RSSR, df1, df2, Fstat, pval}, GrangerStageFromGlobal[x_, y_, stage_, g_, p_] := Module[
+STEP 7. 主循环：连续阶段可单独估计；非连续阶段保持真实日历滞后
+ResultTable = {};
+For[gIndex = 1, gIndex <= Length[GroupSet], gIndex++,
+g = GroupSet[[gIndex]];
+idxRaw = SelectGroup[g];
+UseInternal = AllowStageLag && (g == "Full" || ContiguousQ[idxRaw]);
+If[UseInternal,
+If[g == "Full", xUse = xFull; yUse = yFull,
+xSub = ApplyTransform[x_t[[idxRaw]], TransformRule];
+ySub = ApplyTransform[y_t[[idxRaw]], TransformRule];
+Tsub = Min[Length[xSub["series"]], Length[ySub["series"]]];
+xUse = xSub["series"][[1 ;; Tsub]];
+yUse = ySub["series"][[1 ;; Tsub]];
+];
+pXY = ChooseLag[xUse, yUse, Max[1, Min[pMax, Floor[(Length[yUse]-2)/3]]], ICtype];
+pYX = ChooseLag[yUse, xUse, Max[1, Min[pMax, Floor[(Length[xUse]-2)/3]]], ICtype];
+outXY = GrangerOneDirection[xUse, yUse, pXY];
+outYX = GrangerOneDirection[yUse, xUse, pYX];
+,
+(非连续阶段不压缩时间轴：先在全样本构造真实滞后，再按冲击发生期的阶段筛选。)
+pXY = ChooseLag[xFull, yFull, Max[1, Min[pMax, Floor[(Length[yFull]-2)/3]]], ICtype];
+pYX = ChooseLag[yFull, xFull, Max[1, Min[pMax, Floor[(Length[xFull]-2)/3]]], ICtype];
+outXY = GrangerStageFromGlobal[xFull, yFull, stageFull, g, pXY];
+outYX = GrangerStageFromGlobal[yFull, xFull, stageFull, g, pYX];
+];
+AppendTo[ResultTable, <|"Group"->g, "Direction"->"x -> y", "LagOrder"->Lookup[outXY,"p",Missing[]],
+"F"->Lookup[outXY,"F",Missing[]], "pValue"->Lookup[outXY,"pValue",Missing[]],
+"Sig"->If[KeyExistsQ[outXY,"pValue"],SigMark[outXY["pValue"]],""], "SampleFlag"->outXY["SampleFlag"]|>];
+AppendTo[ResultTable, <|"Group"->g, "Direction"->"y -> x", "LagOrder"->Lookup[outYX,"p",Missing[]],
+"F"->Lookup[outYX,"F",Missing[]], "pValue"->Lookup[outYX,"pValue",Missing[]],
+"Sig"->If[KeyExistsQ[outYX,"pValue"],SigMark[outYX["pValue"]],""], "SampleFlag"->outYX["SampleFlag"]|>];
+];
+OUTPUT PACK
+Result = <|"ResultTable" -> ResultTable|>;
+A3 中国化 Wu–Xia 影子利率估计算法（多期限国债远期利率曲线的非线性状态空间建模与扩展 Kalman 滤波/平滑）
+(
+Input:
+Y[t, m]          : 观测国债收益率（t=1..T；m∈MaturitySet；原则上采用零息收益率， 若输入附息国债到期收益率，需先固定 Bootstrap/NSS 等零息曲线转换方法） MaturitySet      : 期限集合（例如 {0.25,0.5,1,2,3,5,7,10}，单位=年） YieldType        : 收益率数据类型（"ZeroYield" / "ParYield"） ForwardTenor     : 远期利率自身期限（例如 1/12 表示1个月期远期利率） LBSpec           : 有效利率下限设定，包括： "Mode"  -> "Fixed" / "RegimeFixed" / "Estimated" "Value" -> 固定下限值（Mode="Fixed"时使用） "RegimeSeries" -> 制度阶段序列（Mode="RegimeFixed"时使用） "Prior" -> 下限先验区间或均值方差（Mode="Estimated"时可选） ModelSpec        : 模型结构设定（状态因子维度、风险中性动态、噪声结构、 是否加入中国国债曲线修正变量等） EstMode          : 参数估计口径（"FixParam" / "MLE" / "RollingMLE"） Param0           : 初始参数（cP,AP,cQ,AQ,Σ,δ0,δ1,R,LB参数、Γ等） InitState        : 初始状态均值与协方差（X0|0, P0|0） MissingRule      : 缺失期限处理规则（"DropMaturity" / "CurveInterpolate"） SmoothFlag       : 是否执行扩展 RTS 平滑（True/False） ControlSeries    : 中国国债曲线修正变量（可选，如国债供给、资金面、R007-DR007等） CompareSeries    : 比较序列（如7天期逆回购利率、DR007、1Y MLF、1Y LPR；可选）
+Output:
+rShadow[t]       : 中国国债期限结构隐含的影子短端利率
+rNominal[t]      : 有效下限约束后的模型名义短端（max(rShadow, LB_t)）
+LBPath[t]        : 有效利率下限路径
+BindProb[t]      : 影子短端低于有效下限的条件概率
+StateSmooth[t]   : 平滑状态路径（若 SmoothFlag=True） ForwardFit[t,m]  : 各期限远期利率拟合值 LL               : 对数似然（若 EstMode 包含 MLE） FitDiag          : 拟合诊断（测量残差、RMSE、期限点误差、样本外误差等） CompareDiag      : 与政策利率、DR007、MLF、LPR的相关、差异和阶段统计)
+SECTION 0. 零息曲线、远期利率构造与缺失处理
+(0.1 统一期限顺序和收益率口径)
+M = Length[MaturitySet];
+(
+所有利率统一为年化小数。
+例如：
+1.80% -> 0.0180
+20bp  -> 0.0020
+若 Y 为附息国债到期收益率，则需先采用固定方法构建零息收益率曲线。
+零息曲线构造方法在全样本中保持一致，不能按时期临时切换。
+)
+If[YieldType == "ZeroYield",
+ZeroYield[t_, m_] := Y[t, m];
+];
+If[YieldType == "ParYield",
+(
+使用国债价格、票息和到期日信息，通过固定 Bootstrap、NSS
+或单调样条方法构建零息收益率曲线。
+)
+ZeroYield = BuildZeroCurve[Y, MaturitySet, ModelSpec["CurveMethod"]];
+];
+(0.2 构造贴现因子)
+(
+连续复利口径：
+P(t,m) = Exp[-m * ZeroYield(t,m)]
+)
+DiscountFactor[t_, m_] := Exp[-m*ZeroYield[t, m]];
+(0.3 构造固定期限远期利率)
+Δ = ForwardTenor;
+(
+对每个远期起始期限 m，构造从 m 到 m+Δ 的年化远期利率：
+f(t,m,m+Δ)
+= -(1/Δ) Log[P(t,m+Δ)/P(t,m)]
+Wu–Xia观测方程使用固定期限远期利率，
+不直接使用附息国债到期收益率。
+)
+ForwardObs[t_, m_] :=-(1/Δ)*Log[DiscountFactor[t, m + Δ]/DiscountFactor[t, m]];
+fObs[t_] :=Table[ForwardObs[t, MaturitySet[[j]]], {j, 1, M}];
+(0.4 缺失期限采用单一处理口径)
+HandleMissing[fVec_] := Module[{ff = fVec, idxGood, interpFlag},
+If[MissingRule == "DropMaturity",
+(
+删除当期缺失的远期利率期限点，
+同步调整当期观测函数、Jacobian和R矩阵维度。
+)
+idxGood = Select[Range[M], NumericQ[ff[[#]]] &];
+Return[<|"f" -> ff[[idxGood]], "idx" -> idxGood, "interpFlag" -> ConstantArray[False, Length[idxGood]]|>];
+];
+If[MissingRule == "CurveInterpolate",
+(
+插值只在零息贴现曲线构造阶段完成。
+不直接对最终远期利率进行简单线性补值。
+依赖插值得到的远期利率需记录位置，
+并在测量误差协方差R中提高对应期限的方差。
+)
+{ff, interpFlag} =ReconstructForwardFromCurve[ff, MaturitySet, ModelSpec["InterpolationMethod"]];
+Return[<|"f" -> ff, "idx" -> Range[M], "interpFlag" -> interpFlag|>];
+];
+];
+SECTION 1. 中国化 Wu–Xia 非线性状态空间模型
+(
+状态向量 X_t 的口径：
+状态维度 N 采用固定设定。
+基准模型可取3因子，对应期限结构的水平、斜率和曲率。
+模型区分现实概率测度P与风险中性测度Q：
+- P测度描述状态变量的现实时间序列动态；
+- Q测度用于债券与远期利率定价。
+)
+N = ModelSpec["StateDim"];          (例如 3)
+(1.1 现实概率测度P下的状态转移方程)
+(
+X_t = cP + AP X_{t-1} + η_t η_t ~ N(0, Ω) Ω = Σ Σ') cP = Param["cP"];                   (N×1)
+AP = Param["AP"];                   (N×N)
+Σ  = Param["Sigma"];                (N×N)
+Ω  = Σ.Transpose[Σ];                (N×N，半正定)
+(
+要求 AP 的特征根模小于1。
+过程误差协方差记为Ω，避免与风险中性测度Q混淆。
+)
+(1.2 风险中性测度Q下的状态动态)
+(
+X_{t+1} = cQ + AQ X_t + Σ εQ_{t+1} εQ_{t+1} ~ N(0,I)) cQ = Param["cQ"];                   (N×1)
+AQ = Param["AQ"];                   (N×N)
+(1.3 影子短端利率映射)
+(
+影子短端利率定义为状态变量的仿射函数：
+s_t = δ0 + δ1' X_t
+该定义对应无有效下限约束时的潜在短端利率。
+不使用3个月国债收益率或短期限NS拟合值替代影子短端。
+)
+δ0 = Param["Delta0"];               (标量)
+δ1 = Param["Delta1"];               (N×1)
+rShadowFromState[X_] :=δ0 + Transpose[δ1].X;
+(1.4 中国有效利率下限设定)
+GetLB[t_] := Module[{mode, regime}, mode = LBSpec["Mode"];
+If[mode == "Fixed",
+Return[LBSpec["Value"]];
+];
+If[mode == "RegimeFixed",
+regime = LBSpec["RegimeSeries"][[t]];
+Return[Param["LBRegime"][[regime]]];
+];
+If[mode == "Estimated",
+(
+LB可作为待估参数。
+若采用分阶段估计，阶段划分应根据货币政策操作框架变化预先确定。
+政策利率走廊下限可用于设置参数区间或先验，
+采用Wu–Xia闭式近似时，单次估计区间内LB按常数处理；
+分阶段LB应通过预先划分子样本分别估计，不能把当期LB直接外推为全部远期期限的时变下限。
+不直接机械等同于经济意义上的有效利率下限。
+)
+If[KeyExistsQ[LBSpec, "RegimeSeries"],
+regime = LBSpec["RegimeSeries"][[t]];
+Return[Param["LBRegime"][[regime]]],
+Return[Param["LB"]]];
+];
+];
+rNominalFromShadow[r_, lb_] :=Max[r, lb];
+(1.5 Wu–Xia截断正态映射函数)
+NormalPDF[z_] :=Exp[-z^2/2]/Sqrt[2*Pi];
+NormalCDF[z_] :=1/2*(1 + Erf[z/Sqrt[2]]);
+gWX[z_] :=z*NormalCDF[z] + NormalPDF[z];
+(1.6 风险中性测度下未来影子短端的条件均值与方差)
+(
+设 k(m) 为远期起始期限 m 对应的状态步数。
+若模型采用月度频率：
+k(m) = Round[12m]
+实际实现中，期限和状态频率的转换规则需要固定。
+)
+StepsFromMaturity[m_] :=Round[m/ModelSpec["StateStep"]];
+GQ[k_] := If[k == 0, ConstantArray[0, {N,N}], Sum[MatrixPower[AQ,j], {j,0,k-1}]];
+GaussianForwardQ[k_, X_] := Module[{Gk, ak, bk}, Gk = GQ[k];
+bk = Transpose[δ1].MatrixPower[AQ,k];
+ak = δ0 + Transpose[δ1].Gk.cQ - 1/2*Transpose[δ1].Gk.Ω.Transpose[Gk].δ1;
+ak + bk.X];
+(
+GaussianForwardQ[k,X]为无下限高斯仿射期限结构中的远期利率a_k+b_k'X，
+其中负二分之一方差项为债券定价的凸性/风险调整项，不能以未来影子短端条件均值替代。)
+ShadowVarQ[k_] := Module[{varX},
+(
+Q测度下未来状态条件方差：
+Var^Q_t[X_{t+k}]
+= Sum[AQ^j Ω (AQ^j)', j=0,...,k-1]
+)
+If[k == 0,
+Return[0]];
+varX =Sum[MatrixPower[AQ, j].Ω.Transpose[MatrixPower[AQ, j]], {j, 0, k - 1}];
+Transpose[δ1].varX.δ1];
+(1.7 Wu–Xia非线性远期利率定价函数)
+WuXiaForward[m_, X_, lb_] := Module[{k, fG, σ2s, σs, z},
+k = StepsFromMaturity[m];
+fG = GaussianForwardQ[k, X];
+σ2s = ShadowVarQ[k];
+If[k == 0 || σ2s <= ModelSpec["VarianceTolerance"],
+Return[Max[fG, lb]];
+];
+σs = Sqrt[σ2s];
+z = (fG - lb)/σs;
+(
+截断正态期望：
+Wu–Xia近似远期利率 = LB + σ g((f^G-LB)/σ)
+= LB + σ g((μ-LB)/σ)
+)
+lb + σs*gWX[z]];
+(1.8 中国国债曲线修正项，可选)
+CurveAdjustment[t_, j_] := Module[{controls, Γj}, If[ModelSpec["CurveControlMode"] == "Off" || Head[ControlSeries] =!= Association, Return[0]];
+(
+可选控制变量包括：
+- 国债净供给或发行强度；
+- R007与DR007利差；
+- 资金面松紧指标；
+- 汇率压力；
+- 银行、保险等机构配置需求代理指标。
+该部分仅作为国债曲线测量修正项，
+用于减少供给、流动性和市场分割因素对影子利率的干扰。
+)
+controls =Table[ControlSeries[ModelSpec["ControlNames"][[q]]][[t]], {q, 1, Length[ModelSpec["ControlNames"]]}];
+Γj = Param["Gamma"][[j]];
+Γj.controls];
+(1.9 非线性观测方程)
+(
+f_t = h(X_t,LB_t,Z_t) + ε_t ε_t ~ N(0,R) 其中： h_j(X_t) = WuXiaForward(m_j,X_t,LB_t)+ Γ_j Z_t) ForwardModel[t_, j_, X_, lb_] :=WuXiaForward[MaturitySet[[j]], X, lb] +CurveAdjustment[t, j];
+(1.10 观测噪声协方差)
+Rfull = Param["R"];                  (M×M)
+(
+基准可采用期限异方差对角矩阵。
+若某期限远期利率依赖插值得到，
+对应测量方差需乘以大于1的惩罚系数。
+)
+(1.11 非线性观测函数的Jacobian)
+ForwardJacobian[m_, X_, lb_] := Module[{k, fG, σ2s, σs, z, dfdX},
+k = StepsFromMaturity[m];
+(
+无下限高斯远期利率对当前状态的导数：
+∂μ_s(k)/∂X_t = δ1' AQ^k
+)
+dfdX =Transpose[δ1].MatrixPower[AQ, k];
+σ2s = ShadowVarQ[k];
+If[k == 0 || σ2s <= ModelSpec["VarianceTolerance"],
+(
+在k=0时，max函数在下限点不可微。
+实现中可采用分段导数或平滑最大函数。)
+If[rShadowFromState[X] > lb,
+Return[dfdX],
+Return[ConstantArray[0, N]]];
+];
+σs = Sqrt[σ2s];
+fG = GaussianForwardQ[k, X];
+z = (fG - lb)/σs;
+(
+因为 g'(z)=Φ(z)，所以： ∂h/∂X = Φ(z) δ1' AQ^k) NormalCDF[z]*dfdX];
+SECTION 2. 扩展 Kalman Filter
+(2.1 初始化：X0|0, P0|0)
+X = InitState["x0"];                 (N×1)
+P = InitState["P0"];                 (N×N)
+(2.2 存储容器)
+XPred = Table[0, {T}];               (X_t|t-1)
+PPred = Table[0, {T}];               (P_t|t-1)
+XFilt = Table[0, {T}];               (X_t|t)
+PFilt = Table[0, {T}];               (P_t|t)
+vList = Table[0, {T}];               (观测创新v_t)
+SList = Table[0, {T}];               (创新协方差S_t)
+KList = Table[0, {T}];               (扩展Kalman增益)
+ForwardFit = Table[0, {T}];          (远期利率拟合值)
+LBPath = Table[0, {T}];              (有效下限路径)
+LL = 0;                              (对数似然)
+For[t = 1, t <= T, t++,
+(2.3 状态预测步)
+XPredNow =cP + AP.X;
+PPredNow =AP.P.Transpose[AP] + Ω;
+PPredNow =1/2*(PPredNow + Transpose[PPredNow]);
+(2.4 取当期观测并处理缺失期限)
+obsPack =HandleMissing[fObs[t]];
+fNow =obsPack["f"];
+idxNow =obsPack["idx"];
+interpFlagNow =obsPack["interpFlag"];
+(2.5 取得当期有效利率下限)
+LBNow =GetLB[t];
+LBPath[[t]] =LBNow;
+(2.6 计算非线性观测预测)
+fPredNow =Table[ForwardModel[t, idxNow[[q]], XPredNow, LBNow], {q, 1, Length[idxNow]}];
+(2.7 构造当期观测函数Jacobian)
+HNow =Table[ForwardJacobian[MaturitySet[[idxNow[[q]]]], XPredNow, LBNow], {q, 1, Length[idxNow]}];
+(2.8 构造当期测量误差协方差)
+RNow =Rfull[[idxNow, idxNow]];
+(
+若观测期限依赖插值得到，则提高相应测量方差。
+)
+For[q = 1, q <= Length[idxNow], q++,
+If[interpFlagNow[[q]] == True,
+RNow[[q, q]] =RNow[[q, q]]*ModelSpec["InterpolationPenalty"];
+];
+];
+(2.9 创新与创新协方差)
+v =fNow - fPredNow;
+S =HNow.PPredNow.Transpose[HNow] +RNow;
+S =1/2*(S + Transpose[S]);
+(2.10 数值稳定处理)
+(
+优先使用Cholesky分解求解线性方程，
+避免直接计算Inverse[S]。
+若S无法进行Cholesky分解，则加入固定微扰项。
+)
+If[CholeskyDecomposition[S] 失败,
+S =S +ModelSpec["NumericalJitter"]*IdentityMatrix[Length[fNow]];
+];
+(2.11 扩展Kalman增益)
+K =PPredNow.Transpose[HNow].LinearSolve[S, IdentityMatrix[Length[fNow]]];
+(2.12 状态更新)
+X =XPredNow + K.v;
+(2.13 协方差更新，采用Joseph形式)
+IState =IdentityMatrix[N];
+P =(IState - K.HNow).PPredNow.Transpose[IState - K.HNow] +K.RNow.Transpose[K];
+P =1/2*(P + Transpose[P]);
+(2.14 记录)
+XPred[[t]] =XPredNow;
+PPred[[t]] =PPredNow;
+XFilt[[t]] =X;
+PFilt[[t]] =P;
+vList[[t]] =v;
+SList[[t]] =S;
+KList[[t]] =K;
+ForwardFit[[t]] =<|"idx" -> idxNow, "fit" -> fPredNow|>;
+(2.15 似然累加)
+(
+MLE阶段仅使用滤波似然。
+LogDet[S]和v'S^{-1}v应通过Cholesky分解计算，
+避免直接计算Det和Inverse。
+)
+logDetS =StableLogDet[S];
+quadForm =Transpose[v].LinearSolve[S, v];
+LL =LL -1/2*( logDetS +quadForm +Length[fNow]*Log[2*Pi]);
+];
+SECTION 3. 扩展 RTS Smoother
+If[SmoothFlag == True,
+XSmooth =Table[0, {T}];
+PSmooth =Table[0, {T}];
+XSmooth[[T]] =XFilt[[T]];
+PSmooth[[T]] =PFilt[[T]];
+For[t = T - 1, t >= 1, t--,
+(3.1 RTS平滑增益)
+J =PFilt[[t]].Transpose[AP].LinearSolve[PPred[[t + 1]], IdentityMatrix[N]];
+(3.2 平滑状态)
+XSmooth[[t]] =XFilt[[t]] +J.( XSmooth[[t + 1]] -XPred[[t + 1]]);
+(3.3 平滑协方差)
+PSmooth[[t]] =PFilt[[t]] +J.( PSmooth[[t + 1]] -PPred[[t + 1]]).Transpose[J];
+PSmooth[[t]] =1/2*( PSmooth[[t]] +Transpose[PSmooth[[t]]]);
+];
+StateUse =XSmooth;
+StateCovUse =PSmooth;
+,
+StateUse =XFilt;
+StateCovUse =PFilt;
+];
+SECTION 4. 影子利率、名义短端与下限约束概率
+rShadow =Table[0, {T}];
+rNominal =Table[0, {T}];
+BindProb =Table[0, {T}];
+ShadowSE =Table[0, {T}];
+ShadowCI =Table[0, {T}];
+For[t = 1, t <= T, t++,
+(4.1 影子短端利率)
+rShadow[[t]] =rShadowFromState[StateUse[[t]]];
+(4.2 有效下限约束后的模型名义短端)
+rNominal[[t]] =rNominalFromShadow[rShadow[[t]], LBPath[[t]]];
+(4.3 状态条件下的影子利率方差)
+shadowVar =Transpose[δ1].StateCovUse[[t]].δ1;
+ShadowSE[[t]] =Sqrt[Max[shadowVar, 0]];
+(4.4 影子短端低于有效下限的条件概率)
+If[ShadowSE[[t]] > 0,
+BindProb[[t]] =NormalCDF[
+(
+LBPath[[t]] -
+rShadow[[t]]
+)/
+ShadowSE[[t]]
+],
+BindProb[[t]] =If[rShadow[[t]] <= LBPath[[t]], 1, 0];
+];
+(4.5 状态不确定性置信区间)
+ShadowCI[[t]] ={rShadow[[t]] -1.96*ShadowSE[[t]], rShadow[[t]] +1.96*ShadowSE[[t]]};
+];
+SECTION 5. 参数估计（MLE / RollingMLE）
+(*
+若 EstMode == "MLE"： - 目标：最大化扩展Kalman滤波对数似然 LL(Param) - 核心参数：
+cP, AP,
+cQ, AQ,
+Σ,
+δ0, δ1,
+R - 中国化扩展参数：
+LB或分阶段LB，
+国债曲线修正系数Γ - 参数约束：
+AP稳定；
+ΣΣ'半正定；
+R半正定；
+因子旋转识别约束；
+LB处于预先设定的经济合理区间。
+若 EstMode == "FixParam"： - 直接使用Param0； - 不进行数值优化； - 保留LL用于模型比较和诊断。
+若 EstMode == "RollingMLE"： - 在固定滚动窗口内重复估计参数； - 每个时点只使用当时可获得的信息； - 输出实时滤波影子利率； - 不用全样本平滑值替代历史实时信号。*)
+If[EstMode == "MLE" || EstMode == "RollingMLE",
+(5.1 参数向量化与约束重参数化)
+PackParam[θ_] := Module[{},
+(
+θ映射为：
+{cP,AP,cQ,AQ,Σ,δ0,δ1,R,LB,Γ}
+Σ和R使用下三角Cholesky参数化，
+保证协方差矩阵半正定。
+AP使用稳定性参数化或加入特征根约束。
+因子识别可采用：
+- Σ为下三角矩阵；
+- 固定δ1的部分元素；
+- 固定状态因子的尺度和符号。
+)];
+UnpackParam[Param_] := Module[{},
+(
+将模型参数转换为无约束或受约束优化变量θ。
+)];
+(5.2 负对数似然函数)
+NegLL[θ_] := Module[{ParamTemp, LLtemp},
+ParamTemp =PackParam[θ];
+(
+用ParamTemp替换模型中的全部参数，
+重新执行SECTION 1和SECTION 2。
+参数估计阶段关闭平滑，
+仅使用扩展Kalman滤波似然。
+)
+LLtemp =RunExtendedKalmanFilter[ParamTemp, SmoothFlag -> False]["LogLikelihood"];
+-LLtemp];
+(5.3 多初值数值优化)
+(
+为降低局部极值影响，使用多组初始值。
+可先采用Nelder-Mead或全局粗搜索，
+再使用BFGS或信赖域算法精细优化。
+)
+θCandidate = Table[θ0q = GenerateInitialValue[Param0, q];
+FindMinimum[{NegLL[θ], ParameterConstraints[ModelSpec, LBSpec]}, Thread[{θ, θ0q}], Method -> "QuasiNewton"],
+{q, 1, ModelSpec["NumStarts"]}];
+θHat =SelectBestConvergedSolution[θCandidate];
+ParamHat =PackParam[θHat];
+(5.4 使用估计参数重新执行滤波、平滑和影子利率生成)
+FinalModel =RunExtendedKalmanFilter[ParamHat, SmoothFlag -> SmoothFlag];
+];
+SECTION 6. 拟合诊断与中国政策变量对比检验
+FitDiag =<||>;
+(6.1 按远期起始期限计算拟合误差)
+For[j = 1, j <= M, j++,
+fReal =Table[ForwardObs[t, MaturitySet[[j]]], {t, 1, T}];
+fHat =Table[ForwardModel[t, j, StateUse[[t]], LBPath[[t]]], {t, 1, T}];
+idxGood =Select[Range[T], NumericQ[fReal[[#]]] && NumericQ[fHat[[#]]] &];
+rmse =Sqrt[Mean[
+(
+fReal[[idxGood]] -
+fHat[[idxGood]]
+)^2
+]];
+mae =Mean[Abs[fReal[[idxGood]] -fHat[[idxGood]]]];
+maxError =Max[Abs[fReal[[idxGood]] -fHat[[idxGood]]]];
+FitDiag[MaturitySet[[j]]] =
+<|
+"RMSE" -> rmse,
+"MAE" -> mae,
+"MaxAbsError" -> maxError
+|>;
+];
+(6.2 残差时间序列诊断)
+FitDiag["ResidualTest"] =<|
+"MeanResidual" -> ResidualMeanTest[vList],
+"SerialCorrelation" -> ResidualAutocorrelationTest[vList],
+"Heteroskedasticity" -> ResidualHeteroskedasticityTest[vList],
+"LowerBoundPeriodError" -> CompareResidualByBindingState[vList, BindProb]|>;
+(6.3 与7天期逆回购利率比较)
+CompareDiag =<||>;
+If[Head[CompareSeries] === Association && KeyExistsQ[CompareSeries, "Repo7D"],
+repo7d =CompareSeries["Repo7D"];
+idxRepo =Select[Range[T], NumericQ[repo7d[[#]]] && NumericQ[rShadow[[#]]] &];
+CompareDiag["Repo7D"] =<|
+"CorrShadow_Repo7D" -> Correlation[rShadow[[idxRepo]], repo7d[[idxRepo]]],
+"MeanDiffShadow_Repo7D" -> Mean[rShadow[[idxRepo]] -repo7d[[idxRepo]]],
+"MeanDiffNominal_Repo7D" -> Mean[rNominal[[idxRepo]] -repo7d[[idxRepo]]],
+"StageMean" -> StageMeanComparison[rShadow, repo7d, LBSpec["RegimeSeries"]]|>;
+];
+(6.4 与DR007比较)
+If[Head[CompareSeries] === Association && KeyExistsQ[CompareSeries, "DR007"],
+dr =CompareSeries["DR007"];
+idxDR =Select[Range[T], NumericQ[dr[[#]]] && NumericQ[rShadow[[#]]] &];
+CompareDiag["DR007"] =<|
+"CorrShadow_DR007" -> Correlation[rShadow[[idxDR]], dr[[idxDR]]],
+"MeanDiffShadow_DR007" -> Mean[rShadow[[idxDR]] -dr[[idxDR]]],
+"MeanDiffNominal_DR007" -> Mean[rNominal[[idxDR]] -dr[[idxDR]]],
+"LeadLagCorrelation" -> Table[<|"Lag" -> k, "Correlation" -> LeadLagCorrelation[rShadow, dr, k]|>, {k, -ModelSpec["MaxCompareLag"], ModelSpec["MaxCompareLag"]}]|>;
+];
+(6.5 与MLF和LPR比较)
+If[Head[CompareSeries] === Association && KeyExistsQ[CompareSeries, "MLF1Y"],
+mlf =CompareSeries["MLF1Y"];
+CompareDiag["MLF1Y"] =<|
+"LeadLagCorrelation" -> Table[<|"Lag" -> k, "Correlation" -> LeadLagCorrelation[rShadow, mlf, k]|>, {k, 0, ModelSpec["MaxCompareLag"]}],
+"StageMeanDiff" -> StageMeanDifference[rShadow, mlf, LBSpec["RegimeSeries"]]|>;
+];
+If[Head[CompareSeries] === Association && KeyExistsQ[CompareSeries, "LPR1Y"],
+lpr =CompareSeries["LPR1Y"];
+CompareDiag["LPR1Y"] =<|
+"LeadLagCorrelation" -> Table[<|"Lag" -> k, "Correlation" -> LeadLagCorrelation[rShadow, lpr, k]|>, {k, 0, ModelSpec["MaxCompareLag"]}],
+"StageMeanDiff" -> StageMeanDifference[rShadow, lpr, LBSpec["RegimeSeries"]]|>;
+];
+(6.6 下限约束状态统计)
+CompareDiag["LowerBoundBinding"] =<|
+"MeanBindingProbability" -> Mean[BindProb],
+"HighBindingPeriods" -> Select[Range[T], BindProb[[#]] >=ModelSpec["BindingProbabilityThreshold"] &],
+"MeanShadowGap" -> Mean[rShadow -LBPath],
+"MeanShadowGapWhenBinding" -> Mean[Select[Table[If[BindProb[[t]] >=ModelSpec["BindingProbabilityThreshold"], rShadow[[t]] -LBPath[[t]], Missing[]], {t, 1, T}], NumericQ]]|>;
+(6.7 模型使用边界)
+(
+本算法输出解释为：
+中国国债期限结构隐含的影子短端利率。
+该序列主要反映收益率曲线所包含的短端利率预期和
+有效利率下限约束程度。
+存款准备金率、公开市场操作数量、结构性货币政策工具、
+宏观审慎政策和汇率管理等政策信息，
+不能由单一国债影子利率完整反映。
+如需测度中国总体货币政策立场，
+应另行构建包含价格型、数量型和结构型工具的综合政策因子。
+)
+OUTPUT PACK
+Result =<|
+"rShadow" -> rShadow,
+"rNominal" -> rNominal,
+"LBPath" -> LBPath,
+"BindProb" -> BindProb,
+"ShadowSE" -> ShadowSE,
+"ShadowCI" -> ShadowCI,
+"StatePath" -> StateUse,
+"StateCovariance" -> StateCovUse,
+"ForwardFit" -> ForwardFit,
+"LogLikelihood" -> LL,
+"EstimatedParameters" -> If[EstMode == "FixParam", Param0, ParamHat],
+"FitDiag" -> FitDiag,
+"CompareDiag" -> CompareDiag|>;
+A4 利率冲击向净息差传导的阶段化动态响应算法（分阶段 Local Projection）
+(*
+Input:
+r_t               : 利率变量（如DR007、7天期逆回购利率或1Y LPR）
+nim_t             : 净息差序列（NIM，频率和年化口径固定）
+stage_t           : 阶段标签（"Enter" / "Visible" / "Deep"）
+Hmax              : 最大响应期数
+pCtrl             : 控制变量滞后阶数
+Xctrl_t           : 控制变量集合（可为空）
+RateTransformRule : 冲击构造规则（"diff" / "logdiff" / 自定义函数；不重复差分）
+ResponseRule      : 响应口径（"CumulativeChange" / "Level"）
+ShockScale        : 冲击尺度（如0.001=10bp） CIflag            : 是否计算置信区间 CIlevel           : 置信区间水平 SEMode            : 标准误口径（"HAC" / "Cluster" / "BlockBootstrap"）
+Output:
+IRF[h,stage]      : 各阶段第h期动态响应
+SE[h,stage]       : 稳健标准误
+CI[h,stage]       : 置信区间
+SampleDiag        : 各阶段、各预测期有效样本量*)
+STEP 0. 数据变换与统一时间索引
+ApplyRateTransform[s_, rule_] := Module[{out, offset}, If[rule == "diff",    out = Differences[s];      offset = 1];
+If[rule == "logdiff", out = Differences[Log[s]]; offset = 1]; If[Head[rule] === Function, {out, offset} = rule[s]]; <|
+"shock"->out,
+"offset"->offset
+|>]; ratePack = ApplyRateTransform[r_t, RateTransformRule]; shockUse = ratePack["shock"]; offset = ratePack["offset"]; Tmin = Min[Length[shockUse], Length[nim_t]-offset, Length[stage_t]-offset]; shockUse = shockUse[[1;; Tmin]]; nimUse = nim_t[[1 + offset;; offset + Tmin]]; stageUse = stage_t[[1 + offset;; offset + Tmin]]; XctrlUse = AlignControls[Xctrl_t, offset, Tmin];
+STEP 1. 对每个预测期构造共同有效样本
+Stages = {"Enter", "Visible", "Deep"};
+IRF = Association[]; SE = Association[]; CI = Association[]; SampleDiag = Association[];
+For[sIndex = 1, sIndex <= Length[Stages], sIndex++,
+s = Stages[[sIndex]];
+IRF[s] = Table[Missing[], {Hmax + 1}];
+SE[s]  = Table[Missing[], {Hmax + 1}];
+CI[s]  = Table[Missing[], {Hmax + 1}];
+SampleDiag[s] = Table[0, {Hmax + 1}];
+For[h = 0, h <= Hmax, h++,
+tIdx = Range[Max[pCtrl + 1, 2], Tmin - h];
+tIdx = Select[tIdx, stageUse[[#]] == s &];
+If[ResponseRule == "CumulativeChange",
+y = nimUse[[tIdx + h]] - nimUse[[tIdx - 1]], y = nimUse[[tIdx + h]]];
+shock = shockUse[[tIdx]];
+Zlag = BuildLagControls[shockUse, nimUse, XctrlUse, tIdx, pCtrl];
+Z = Join[ConstantArray[{1}, Length[tIdx]], shock[[All, None]], Zlag, 2];
+SampleDiag[s][[h + 1]] = Length[y];
+If[Length[y] <= Dimensions[Z][[2]] + 2, Continue[]]; β = LeastSquares[Z, y]; resid = y - Z.β; IRF[s][[h + 1]] = β[[2]] * ShockScale; If[CIflag,
+If[SEMode == "HAC",
+Varβ = HACCovariance[Z, resid, Bandwidth -> Max[h, pCtrl]], Varβ = RobustCovariance[Z, resid, SEMode]];
+SE[s][[h + 1]] = Sqrt[Varβ[[2,2]]] * ShockScale;
+zCrit = Quantile[NormalDistribution[0,1], (1 + CIlevel)/2];
+CI[s][[h + 1]] = {IRF[s][[h + 1]] - zCrit*SE[s][[h + 1]], IRF[s][[h + 1]] + zCrit*SE[s][[h + 1]]};
+];
+];
+];
+STEP 2. 结果解释边界
+(*
+若shockUse仅由利率变化构造，结果解释为“利率变动的条件动态响应”。
+只有在使用可识别的外生政策意外或工具变量时，才解释为因果货币政策冲击响应。
+阶段筛选始终保留真实时间索引，不将非连续阶段样本拼接为相邻观测。*)
+OUTPUT PACK
+Result = <|"IRF"->IRF, "SE"->If[CIflag,SE,None], "CI"->If[CIflag,CI,None], "SampleDiag"->SampleDiag|>;
+A5 利率下行情景下商业银行盈利弹性测算算法（基于资产负债重定价的 NII / NIM / ROA / ROE 情景分析）
+(*
+Input:
+ΔrSet          : 冲击绝对值集合（例如 {0.001,0.002} 对应10bp、20bp）
+ShockDirection : "Down" / "Up"；算法内部统一冲击符号
+BalanceSheet0  : 基准期资产负债表（平均生息资产、平均总资产、平均净资产等）
+BucketA        : 资产分桶及余额、基准收益率、重定价日程、Beta、提前还款等
+BucketL        : 负债分桶及余额、基准成本率、重定价日程、Beta、成本下限等
+RepriceRuleA   : 资产端合同重定价和到期替换规则
+RepriceRuleL   : 负债端重定价、存款下限和期限迁移规则
+BetaRangeA     : 资产端传导系数区间
+BetaRangeL     : 负债端传导系数区间
+Horizon        : 情景作用期（以年表示，如0.25/0.5/1）
+TaxRate        : 所得税率
+OtherIncomeRule: 非息收入和费用联动规则
+CapitalRule    : 权益固定或利润滚存规则
+Unit           : 输出金额单位
+Output:
+ScenarioTable  : 不利、基准和有利情景下的ΔNII、ΔNIM、ΔROA、ΔROE
+DetailTable    : 分桶贡献及重定价时间分解
+PlotData       : 冲击大小与指标变化*)
+STEP 0. 冲击符号和基准口径
+SignedShock[x_] := If[ShockDirection == "Down", -Abs[x], Abs[x]];
+AvgEA0 = BalanceSheet0["AvgEarningAssets"];
+AvgA0  = BalanceSheet0["AvgTotalAssets"];
+AvgE0  = BalanceSheet0["AvgEquity"];
+NII0   = BalanceSheet0["NII"];
+STEP 1. Horizon内重定价影响因子
+RepriceImpactFactor[bucket_, Horizon_] := Module[{schedule, resetInterval, remainMat, effectiveReset}, schedule = Lookup[bucket, "RepriceSchedule", Missing[]];
+If[schedule =!= Missing[],
+Return[IntegrateRepricedBalanceShare[schedule, Horizon]]];
+resetInterval = bucket["RepriceInterval"];
+remainMat = bucket["RemainMat"];
+effectiveReset = Min[resetInterval, remainMat];
+(* 返回“重定价余额比例×重定价后在情景期内生效的平均年数”。 *)
+ApproximateRepriceExposure[effectiveReset, Horizon, Lookup[bucket,"PrepayRate",0]]];
+STEP 2. 单桶利率传导和利息金额变化
+BetaAt[beta_, i_, n_] := If[VectorQ[beta] && Length[beta] == n, beta[[i]], beta];
+BucketImpactA[Δr_, betaA_, Horizon_] := Module[{detail = {}, i, bal, factor, dRate, contrib}, For[i = 1, i <= Length[BucketA], i++, bal = BucketA[[i]]["Balance"];
+factor = RepriceImpactFactor[BucketA[[i]], Horizon];
+dRate = BetaAt[betaA, i, Length[BucketA]] * Δr;
+contrib = bal * dRate * factor;
+AppendTo[detail, <|"Bucket"->BucketA[[i]]["Name"], "ImpactFactor"->factor,
+"Beta"->BetaAt[betaA, i, Length[BucketA]], "ΔYield"->dRate, "ΔIntIncome"->contrib|>];
+];
+<|"Sum"->Total[detail[[All,"ΔIntIncome"]]], "Detail"->detail|>];
+BucketImpactL[Δr_, betaL_, Horizon_] := Module[{detail = {}, j, bal, factor, baseCost, floor, rawNew, newCost, dCost, contrib}, For[j = 1, j <= Length[BucketL], j++, bal = BucketL[[j]]["Balance"];
+factor = RepriceImpactFactor[BucketL[[j]], Horizon];
+baseCost = BucketL[[j]]["CostRate0"];
+floor = Lookup[BucketL[[j]], "CostFloor", -Infinity];
+rawNew = baseCost + BetaAt[betaL, j, Length[BucketL]]*Δr;
+newCost = Max[rawNew, floor];
+dCost = newCost - baseCost;
+contrib = bal * dCost * factor;
+AppendTo[detail, <|"Bucket"->BucketL[[j]]["Name"], "ImpactFactor"->factor,
+"Beta"->BetaAt[betaL, j, Length[BucketL]], "CostFloor"->floor, "ΔCost"->dCost, "ΔIntExpense"->contrib|>];
+];
+<|"Sum"->Total[detail[[All,"ΔIntExpense"]]], "Detail"->detail|>];
+STEP 3. 指标映射（金额为Horizon期内累计值）
+MapToMetrics[ΔNII_, Horizon_] := Module[{ΔOther, ΔProfit, annualFactor, ΔNIM, ΔROA, ΔROE, E1}, ΔOther = ApplyOtherIncomeRule[OtherIncomeRule, ΔNII, Horizon];
+ΔProfit = (ΔNII + ΔOther)*(1 - TaxRate);
+annualFactor = 1/Horizon;
+ΔNIM = ΔNII/AvgEA0 * annualFactor;
+ΔROA = ΔProfit/AvgA0 * annualFactor;
+If[CapitalRule == "EquityFixed",
+ΔROE = ΔProfit/AvgE0 * annualFactor, E1 = AvgE0 + ΔProfit*(1 - BalanceSheet0["PayoutRatio"]);
+ΔROE = (BalanceSheet0["Profit0"] + ΔProfit)/E1*annualFactor - BalanceSheet0["ROE"]];
+ScaleUnit[<|"ΔNII"->ΔNII, "ΔNIM"->ΔNIM, "ΔROA"->ΔROA, "ΔROE"->ΔROE|>, Unit]];
+STEP 4. 不利、基准和有利传导组合
+betaA_low = BetaRangeA[[1]]; betaA_high = BetaRangeA[[2]];
+betaL_low = BetaRangeL[[1]]; betaL_high = BetaRangeL[[2]];
+ParamCases = {<|
+"Tag"->"Adverse",
+"betaA"->betaA_high,
+"betaL"->betaL_low|>,
+<|"Tag"->"Base",      "betaA"->Mean[BetaRangeA], "betaL"->Mean[BetaRangeL]|>,
+<|"Tag"->"Favorable", "betaA"->betaA_low,         "betaL"->betaL_high|>};
+(* 降息时，不利组合对应资产端传导快、负债端传导慢；有利组合方向相反。 *)
+STEP 5. 主循环
+ScenarioTable = Association[]; DetailTable = Association[]; PlotData = {};
+For[s = 1, s <= Length[ΔrSet], s++,
+Δr = SignedShock[ΔrSet[[s]]];
+CaseOut = {}; CaseDetail = {};
+For[c = 1, c <= Length[ParamCases], c++,
+outA = BucketImpactA[Δr, ParamCases[[c]]["betaA"], Horizon];
+outL = BucketImpactL[Δr, ParamCases[[c]]["betaL"], Horizon];
+ΔNII = outA["Sum"] - outL["Sum"];
+metrics = MapToMetrics[ΔNII, Horizon];
+AppendTo[CaseOut, Join[<|"Δr"->Δr, "Case"->ParamCases[[c]]["Tag"]|>, metrics]];
+AppendTo[CaseDetail, <|"Δr"->Δr, "Case"->ParamCases[[c]]["Tag"],
+"AssetDetail"->outA["Detail"], "LiabDetail"->outL["Detail"]|>];
+];
+ScenarioTable[Δr] = CaseOut;
+DetailTable[Δr] = CaseDetail;
+baseRow = First@Select[CaseOut, #["Case"] == "Base" &];
+AppendTo[PlotData, <|"Δr"->Δr, "ΔNIM"->baseRow["ΔNIM"], "ΔROE"->baseRow["ΔROE"]|>];
+];
+OUTPUT PACK
+Result = <|"ScenarioTable"->ScenarioTable, "DetailTable"->DetailTable, "PlotData"->PlotData|>;
+A6 约束状态驱动的商业银行大类资产配置与可行域评估算法（增量配置方向、三情景可行域与监管指标复核的统一框架）
+ALGORITHM: NIM-State Robust Allocation Strategy Model
+(Bandwidth + Increment Direction + Regime Learning + Bayesian Drift + Quantile Forecast + MPC + RL Weight Tuning)
+I. INPUTS / OUTPUTS
+INPUTS (public & reproducible; annual/quarter reports + public market rates):
+T                    : time index (quarters or years), t = 1..|T|
+# 时间粒度采用季度口径；年频口径的动态分辨率较低。
+A_t                  : total assets (report)
+# 总资产规模（年报/季报表内），用于把“权重”映射成监管口径量（HQLA/RSF等）
+g_t                  : asset growth rate (report YoY/HoH or scenario)
+# 增量资产规模 ΔA_t = g_t * A_{t-1}，是“增量配置”落地的关键
+w_{t-1} (6x1)        : stock weights last period (six-asset buckets)
+# 上期六大类资产存量权重来自年报映射，与新增配置比例分开计量。
+Market rates:
+LPR1_t, LPR5_t     : 1Y/5Y LPR (public)
+# 资产端定价锚（贷款/类信贷再定价），也可扩展MLF/7D OMO
+DR007_t            : money-market rate (public)
+# 负债端资金价格锚（同业/存单/回购），也是负债成本再定价的关键proxy
+YC_gov_t(m)        : gov yield curve by maturity (public)
+YC_cred_t(m)       : high-grade credit curve by maturity (public)
+# 用来构造“期限结构/利差/久期风险/资产收益proxy”，m是期限维度
+Bank margin inputs (report):
+rA_t               : avg earning-asset yield
+rL_t               : avg interest-bearing liability cost
+# 资产收益率和负债成本率按年报披露口径计算。
+(optional) repricing proxies (report narratives/tables):
+loan_reprice_proxy_t, deposit_reprice_proxy_t
+# 可用“贷款重定价周期披露/存款定期化比例/结构性存款占比”等做proxy
+Regulatory metrics & thresholds (Basel/CBIRC; public):
+CAR_bar, LCR_bar, NSFR_bar     : minimums or internal targets
+# 阈值可采用监管最低值或内部管理目标值，并在配置中保持统一口径。
+δ                             : chance-constraint tail probability (e.g., 5%)
+# 分位数约束置信水平。δ越小越保守（更“硬”），可随阶段变化（HMM输出）
+Bucket parameters per asset i=1..6 (ω_i, h_i, r_i, D_i): ω_i                : RWA weight proxy (reg/proxy)
+# 资本占用强度采用 RWA 代理参数，用于方向性映射，并记录参数来源和替代口径。
+h_i                : HQLA eligibility ratio proxy (reg/proxy)
+# 该类资产可计入HQLA的比例（HQLA资格/折扣），可按监管资产类别粗映射
+r_i                : RSF factor proxy (reg/proxy)
+# NSFR中稳定资金需求系数RSF proxy；不同资产期限/流动性对应不同r_i
+D_i                : duration / repricing horizon proxy (curve + bucket repricing)
+# 久期或再定价周期，用于利率风险惩罚；债券用久期，贷款用重定价间隔proxy
+Business hard bands (optional):
+w_min_base[i], w_max_base[i]  : governance bands
+# 业务治理边界（风险偏好/监管限额/集中度/交易额度），属于硬约束
+Risk/utility and penalty weights (to be tuned, time-varying allowed):
+λ_var_t, λ_cap_t, λ_liq_t     : objective tradeoff weights
+κ_LCR_t, κ_NSFR_t             : shortfall penalty weights
+cK_t                          : capital shadow price baseline (optional)
+# 这些参数用于调节目标函数；RL 仅更新参数，不修改 Ω_t 或直接生成 w。
+Prediction / control horizon:
+H                              : MPC horizon (integer)
+# MPC预测期（如4~8个季度），H越长越稳健但计算更重
+Conditional GAN scenario specification (optional):
+GANSpec.ConditionSet              : HMM状态概率、利率阶段、曲线因子、资金面与约束余量
+GANSpec.GenerateVariables         : DR007、国债/信用曲线、资金成本、资产收益率及风险因子
+GANSpec.PathLength                : 单条生成路径长度
+GANSpec.ScenarioNumber            : 每期生成情景数量
+GANSpec.StressSamplingRatio       : 压力状态情景抽样比例
+GANSpec.EconomicConstraintSet     : 期限结构、经济关系、变量边界与监管一致性校验
+GANSpec.RandomSeed                : 随机种子，用于复现
+Optional dynamic modules (ON/OFF):
+HMM_state_module
+Conditional_GAN_scenario_module
+Bayes_update_module
+ML_quantile_module
+MPC_module
+RL_tuning_module
+# 采用开关式部署：先执行主求解（Step7/8），再逐个加模块，主求解链保持不变
+OUTPUTS (per period t):
+w_lower[i], w_upper[i]           : feasible bandwidth for each bucket
+# 每类资产可上调/下调的范围（可行域投影/扫描得出）
+Δw*_t                            : incremental allocation for new assets
+# 新增资产配置比例，作为增量执行口径。
+η_max                            : max feasible step length along Δw direction
+# 沿着方向d*还能走多远（边界命中），用于“空间收缩程度”解释
+binding_report                   : constraints binding at boundary (CAR/LCR/NSFR/bands/etc.)
+# 边界由哪条约束命中（可多个），用于报告解释
+μ_CAR, μ_LCR, μ_NSFR             : shadow prices (multipliers) for解释力
+# 乘子越大，表示该约束对可行域的边际压缩作用越强。
+regime:
+s_hat_t                         : inferred regime label
+γ_t(s)                          : regime probabilities
+# 阶段识别结果：概率γ_t用于“渐进调参”，避免做硬切换避免抖动
+GeneratedScenarioSet_t            : historical + regulatory stress + conditional GAN scenarios
+# GAN仅扩展情景分布，不直接输出w或Δw，不替代监管压力测试。
+diagnostics:
+feasibility flag, slacks, stability, sensitivity
+# 用于输出“是否可行、余量多少、是否不稳定/过度敏感”
+II. DEFINITIONS / MODEL OBJECTS
+BUCKETS i=1..6: 1: Credit (loans) 2: Bond investments 3: Interbank & money-market assets 4: Trading & derivatives 5: Central bank & government-like assets 6: Wealth-management & fund-related investments (look-through proxy where feasible)
+# 六大类资产需固定；第6类若无法穿透，用“理财/基金投向proxy+表外规模proxy”做近似
+CONSTRAINTS:
+- simplex: Σ_i w_i = 1  (or <=1 if you deliberately leave "other assets" blank)
+# 年报映射未覆盖全部资产时，权重和采用 <=1 的留白口径。
+- nonnegativity: w_i >= 0 - governance bands: w_min_base[i] <= w_i <= w_max_base[i]
+- regulatory: CAR(w) >= CAR_bar, LCR(w) >= LCR_bar, NSFR(w) >= NSFR_bar - chance constraints (if enabled): q_δ(·) >= threshold
+# 分位数约束把“最坏情形也过线”写进模型
+STATE / PARAMETERS:
+- NIM_t := rA_t - rL_t  (state variable)
+# NIM 作为状态变量，连接 HMM、贝叶斯更新与约束强度。
+- θ_t: elasticities controlling repricing and stickiness (drifting over time)
+# 再定价弹性、成本黏性等参数随时间漂移
+- λ_t: penalty weights (only tuned by RL, never directly output weights)
+# RL只调λ/κ/cK等“惩罚参数”，不直接输出w或Δw
+III. STEP 0. DEFINE MAPPING (REPORT → BUCKETS)
+STEP 0.1  Define mapping rules:
+Map reported balance-sheet/investment items to six buckets (traceable to notes/tables).
+Ensure mapping is consistent across periods.
+# 同一资产项跨期保持固定 bucket 映射，避免分类变化形成虚假波动。
+STEP 0.2  Build data structures:
+For each t:
+store bucket stocks, weights w_{t-1}, available repricing/duration proxies if disclosed.
+# 数据结构采用 DataFrame 或 Dict：{t: {A_t, w, rates, metrics, proxies}}。
+IV. STEP 1. DATA INGESTION & CLEANING
+FOR each t in T:
+Load public rates:
+LPR1_t, LPR5_t, DR007_t, YC_gov_t(m), YC_cred_t(m)
+# 曲线可以用“关键期限点 + 插值”存储；后续久期/利差/斜率因子会用到
+Load bank report data:
+A_t, w_{t-1}, rA_t, rL_t
+(if disclosed) CAR_t, LCR_t, NSFR_t
+(optional) Π_nonint_t, Prov_t, C_t, Div_t, capital components
+# 如果报表不披露NSFR细项，可直接用披露的NSFR值做“校准锚”，再用proxy映射权重变化
+Validate: - align by quarter-end / year-end - handle missing market curve points by interpolation
+- keep report series as reported (no smoothing unless explicitly defined) - check weight sum: Σ w_{t-1} <= 1 (allow blank "other assets" if designed)
+# 市场数据可插值；报表数据原则上不平滑
+V. STEP 2. NIM AS STATE VARIABLE (MECHANISM CORE)
+STEP 2.1  Construct margin state:
+NIM_t := rA_t - rL_t
+# NIM 采用年报披露值或一致口径重算值，并进行交叉核对。
+STEP 2.2  Liability cost mechanism with stickiness:
+Define market-rate proxy:
+r_mkt_t := DR007_t
+# 资金市场成本锚：同业负债、存单发行、回购成本等
+Define deposit cost proxy:
+r_dep_t := deposit_reprice_proxy_t if available else infer from report cost components
+# 存款成本proxy可用“存款利息支出/存款平均余额”或“计息负债成本率中存款部分”近似
+Define market-based funding share proxy:
+α_t := funding_mix_t (report-based) or stable proxy
+# α_t反映“市场化负债占比”，占比越高，DR007传导越快越强
+Liability cost:
+rL_t := α_t * r_mkt_t + (1 - α_t) * r_dep_t
+# 该式刻画存款成本对 DR007 的滞后传导。
+STEP 2.3  Asset yield mechanism (bucket repricing):
+Use weight vector w_{t} and bucket yields r_{i,t}:
+rA_t := Σ_i w_{i,t} * r_{i,t}
+# 资产端平均收益率由各bucket收益率加权形成（方向性表达）
+Bucket yield specification (conceptual; can be estimated or scenario-set):
+r_{i,t} = r̄_{i,t}+ β_i^LPR * ΔLPR_t+ β_i^M   * ΔDR007_t - ℓ_{i,t}
+#
+# - r̄_{i,t}: 基准收益（可从曲线/历史回归/年报收益分解近似）
+# - β: 再定价弹性（后面Bayes更新）
+# - ℓ: 损失/折价/流动性折扣（对交易/衍生品、信用类更重要）
+Notes: - β and ℓ are not hard-coded assumptions; can be learned via Bayes module or set as scenario priors.
+- This preserves non-linear/partial pass-through; avoids “funding ↓ implies deposit cost ↓ linearly”.
+# 这里的关键是“不线性、不断言完全传导”，让机制更符合中国语境
+VI. STEP 3. REGIME LEARNING + PARAMETER DRIFT + DISTRIBUTION FORECAST (OPTIONAL MODULES)
+# These modules feed into constraints (chance constraints) and penalty weights (λ, κ, cK),
+# but NEVER bypass Ω_t or governance constraints.
+# 所有智能模块只影响“参数与预测”，不能改变约束集合Ω_t，更不能绕开监管阈值
+------------------------------------------------------------
+STEP 3A. HMM / Regime Learning (隐马尔可夫)
+------------------------------------------------------------
+IF HMM_state_module == ON:
+Define regimes S = {1,2,3}: 1: "NIM controllable" (constraints implicit/loose) 2: "constraint becoming explicit" 3: "constraint hardening"
+# 三阶段对应“息差可控—约束显性化—约束硬化”，用于解释带宽为何收缩
+Construct observation vector y_t:
+y_t := [NIM_t, ΔNIM_t, CAR_t (or proxy), LCR_t (or proxy), NSFR_t (or proxy), ΔRWA_proxy_t, Δw_proxy_t]
+# 观测向量要能反映“息差变化+约束是否逼近+资产结构是否被动调整”
+# ΔRWA_proxy可由RWA_int(w)变化近似；Δw_proxy可用||w_t - w_{t-1}||表示结构漂移
+HMM specification:
+s_t ∈ {1,2,3}
+Transition: P(s_t=j | s_{t-1}=i) = p_ij Emission: y_t | s_t=j ~ Dist(·; φ_j)
+# 发射分布可先用高斯/学生t；参数φ_j对应不同阶段的均值/方差结构
+Fit / update HMM parameters (online or rolling window):
+Estimate {p_ij, φ_j} using historical y_{1:t}
+# 工程实现采用rolling window（如过去20~40个季度），避免结构突变导致参数失真
+Infer regime probabilities (filtering):
+γ_t(j) := P(s_t=j | I_t), j=1..3
+# 用前向滤波得到当期阶段概率γ_t，后面用于“软调整”而非硬切换
+Set regime label:
+s_hat_t := argmax_j γ_t(j) Regime-aware adjustments (do NOT change hard constraints; only parameterize them):
+- tighten δ_t if regime hardening probability high:
+δ_t := f_δ(γ_t(3))      with δ_t ≤ δ_base
+# 约束硬化概率高→更保守→用更小δ（更左尾）
+- increase capital scarcity proxy when regime hardening:
+cK_t := f_cK(γ_t(3))
+# 资本越稀缺，资本占用惩罚越大（类似内生资本影子价格）
+- adjust penalty weights baseline:
+κ_LCR_t, κ_NSFR_t := f_κ(γ_t(2), γ_t(3))
+# 在显性化/硬化阶段，流动性缺口惩罚要更强，避免逼线运行
+ELSE:
+Set:
+γ_t(j) := fixed prior (e.g., [1,0,0]) s_hat_t := 1 δ_t := δ_base
+# 不开HMM时，就当一直在阶段1（最宽松），但仍受监管硬约束
+------------------------------------------------------------
+STEP 3A-G. Conditional GAN Scenario Expansion（条件生成式情景扩展） ------------------------------------------------------------
+IF Conditional_GAN_scenario_module == ON:
+Define condition vector:
+c_t := [γ_t(1), γ_t(2), γ_t(3), LPR1_t, LPR5_t, DR007_t, curve level/slope/curvature factors, credit spread and liquidity factors, NIM_t, CAR slack, LCR slack, NSFR slack]
+Train or rolling-update conditional generator and discriminator:
+G(z, c_t) -> future joint path ZPath^(b)
+D(ZPath, c_t) -> probability of historical-consistent path
+# 训练样本以真实日频/底层数据为主；低频监管指标不得机械复制成日频独立标签。
+FOR b = 1,...,GANSpec.ScenarioNumber:
+noise_b := DrawNoise[GANSpec.RandomSeed + b]
+RawPath_b := G(noise_b, c_t)
+ValidPath_b := EconomicConstraintCheck[RawPath_b, GANSpec.EconomicConstraintSet]
+IF ValidPath_b == False:
+Reject RawPath_b OR ProjectToAdmissibleScenarioSet[RawPath_b]
+ELSE:
+Store RawPath_b
+END FOR
+GANScenarioSet_t := TailReweight[StoredPaths, GANSpec.StressSamplingRatio, γ_t(3)] GeneratedScenarioSet_t := Union[HistoricalScenarioSet_t, RegulatoryStressSet_t, GANScenarioSet_t]
+# GeneratedScenarioSet_t供Bayes/分位数预测、机会约束、MPC和安全RL训练环境调用。
+# GAN不改变Ω_t、监管阈值和治理边界，也不直接生成配置权重。
+ELSE:
+GeneratedScenarioSet_t := Union[HistoricalScenarioSet_t, RegulatoryStressSet_t]
+STEP 3B. Bayesian Learning (参数漂移：再定价弹性/成本黏性)
+------------------------------------------------------------
+IF Bayes_update_module == ON:
+Define parameter vector θ_t including (example):
+θ_t := {β_i^LPR (i=1..6), β_i^M   (i=1..6), stickiness parameters for r_dep transmission, optional: loss haircuts ℓ dynamics}
+# θ_t 为机制参数，用于刻画利率变化对 NIM 与约束条件的影响。
+State evolution (random walk, regime-dependent noise):
+θ_t = θ_{t-1} + u_t u_t ~ N(0, Q_{s_hat_t})
+# 参数漂移用随机游走；在阶段3可允许更大漂移（Q更大），反映机制不稳定
+Observation equation (margin formation):
+NIM_t = f(LPR1_t, LPR5_t, DR007_t, X_t; θ_t) + ε_t
+ε_t ~ N(0, R)
+# f(·)可以是线性状态空间，也可非线性但要可滤波；X_t是补充特征（负债结构、期限结构等）
+Bayesian update:
+p(θ_t | I_t) ∝ p(NIM_t | θ_t, I_{t-1}) · p(θ_{t-1} | I_{t-1})
+# 工程实现上就是Kalman filter / particle filter / variational Bayes
+Output:
+posterior mean θ̂_t and posterior predictive distribution for:
+NIM_{t+k}, k=1..H
+# 输出未来 NIM 分布，供机会约束和情景校验调用。
+ELSE:
+Use fixed θ̂ (scenario priors) and deterministic NIM projections if needed.
+# 不开Bayes时，β可用历史回归常数或情景设定
+------------------------------------------------------------
+STEP 3C. ML Quantile Forecast (条件分位数预测：NIM/CAR/LCR/NSFR)
+------------------------------------------------------------
+IF ML_quantile_module == ON:
+Define target variables z in:
+z ∈ {NIM, CAR, LCR, NSFR}
+# 预测对象为关键约束指标的条件分布和分位数。
+Define feature vector x_t:
+x_t := [LPR1_t, LPR5_t, DR007_t, curve slope/level factors from YC_gov_t, YC_cred_t, funding mix proxies, bucket weights w_{t-1}, regime probabilities γ_t(·)]
+# 特征既包含利率环境，也包含银行结构（w与负债结构），并把γ_t作为“阶段信息”
+For each z and forecast horizon k=1..H: Train / update quantile model M_z,k,τ for τ ∈ {δ_t, 0.5, 1-δ_t} Examples: - Quantile Regression Forest - GBDT quantile model
+# 工程上按期滚动更新或定期重训；τ要覆盖左尾/中位/右尾
+Produce quantile forecasts:
+q̂_τ(z_{t+k} | x_t), for τ ∈ {δ_t, 0.5, 1-δ_t}
+ELSE:
+Use simple scenario bands or Bayesian predictive only.------------------------------------------------------------
+STEP 3D. Distribution Fusion (Bayes + ML) to support chance constraints
+------------------------------------------------------------
+IF (Bayes_update_module == ON) AND (ML_quantile_module == ON):
+Define mixing weight ω_t depending on regime:
+ω_t := f_ω(γ_t(1), γ_t(2), γ_t(3))
+# 可设：阶段越稳定（γ1高）越信Bayes；阶段越硬化越信ML（抗结构突变）
+For each z and k:
+Construct fused distribution representation:
+q̂_δ(z_{t+k}) := ω_t * q̂_δ^Bayes(z_{t+k}) + (1-ω_t) * q̂_δ^ML(z_{t+k}) (apply similarly for median/upper quantiles if needed)
+# 这里用“分位数融合”是工程折中；更严格可用混合分布再取分位数（计算更重）
+ELSE IF only one module available:
+Use that module’s quantiles as q̂_δ(·).
+VII. STEP 4. CONSTRAINT MAPPING (WEIGHTS → CAR/LCR/NSFR), FRONT-LOADED
+Decision variables:
+w_t (6x1)    : portfolio weights
+Δw_t (6x1)   : incremental allocation for new assets
+d (6x1)      : local direction vector (used inside solver)
+# w是存量结构，Δw是新增结构，d是求解器内部的方向变量（之后会映射成Δw*）
+------------------------------------------------------------
+STEP 4.1 RWA intensity (proxy) ------------------------------------------------------------
+RWA_int(w) := Σ_i w_i * ω_i ------------------------------------------------------------
+STEP 4.2 LCR mapping (proxy) ------------------------------------------------------------
+HQLA(w) := A_t * Σ_i w_i * h_i LCR(w)  := HQLA(w) / NCO_t where NCO_t is taken from report disclosure if possible, else use stable proxy consistent with disclosed LCR.
+# NCO 细项缺失时，以披露 LCR 反推值作为校准锚。
+------------------------------------------------------------
+STEP 4.3 NSFR mapping (proxy) ------------------------------------------------------------
+RSF(w)  := A_t * Σ_i w_i * r_i NSFR(w) := ASF_t / RSF(w) where ASF_t proxied from report NSFR disclosure or stable proxy.
+# ASF同理：用披露NSFR反推ASF或用稳定资金结构proxy；关键是“权重变化→RSF变化”方向对
+------------------------------------------------------------
+STEP 4.4 CAR mapping (profit-capital-RWA chain; directional) ------------------------------------------------------------
+Profit proxy:
+π_t := NIM_t * A_t + Π_nonint_t - Prov_t - C_t Capital evolution proxy: K_t := K_{t-1} + π_t - Div_t
+# 资本滚动用于把NIM状态与CAR约束联通起来（机制闭环）
+CAR(w) := K_t / (A_t * RWA_int(w))
+# CAR是方向性映射：权重变化主要通过RWA_int影响分母；更精细可加入资本内生补充机制
+------------------------------------------------------------
+STEP 4.5 Chance constraints (if enabled) ------------------------------------------------------------
+IF (Bayes_update_module or ML_quantile_module) is ON:
+For k=1..H:
+Enforce conservative quantile constraints:
+q̂_δt(CAR_{t+k}(w_{t+k}))  >= CAR_bar
+q̂_δt(LCR_{t+k}(w_{t+k}))  >= LCR_bar
+q̂_δt(NSFR_{t+k}(w_{t+k})) >= NSFR_bar
+ELSE:
+Use point constraints at t (or scenario-based stress) only:
+CAR(w) >= CAR_bar
+LCR(w) >= LCR_bar
+NSFR(w) >= NSFR_bar ------------------------------------------------------------
+STEP 4.6 Base feasibility constraints ------------------------------------------------------------
+Simplex:
+Σ_i w_i = 1   (or <=1 if “other assets blank” design is used)
+Bounds:
+w_i >= 0
+w_min_base[i] <= w_i <= w_max_base[i]
+Additional governance constraints (optional):
+duration cap: Σ_i w_i * D_i <= D_cap
+trading cap:  w_4 <= w4_cap
+concentration caps, etc.
+Define feasible set Ω_t accordingly.
+VIII. STEP 5. OBJECTIVE: ROBUST MULTI-OBJECTIVE (USED FOR DIRECTION)
+Define utility proxy U(w) for direction-finding (not claiming final optimum):
+Expected return proxy:
+E[R(w)] := Σ_i w_i * μ_i,t with μ_i,t computed from repricing + curve + haircut proxies Risk proxy using duration/DV01: D_p(w) := Σ_i w_i * D_i Var proxy := (D_p(w))^2 * Var(Δy)_t
+# 这里用久期把利率风险粗入模（可解释、易落地）；Var(Δy)可用国债收益率波动proxy
+Capital penalty:
+Cap(w) := cK_t * RWA_int(w)
+# 资本稀缺影子价格×RWA强度，体现“资本约束硬化”时资本占用更贵
+Liquidity shortfall penalties:
+Liq_LCR(w)  := κ_LCR_t  * max(0, LCR_bar  - LCR(w))^2 Liq_NSFR(w) := κ_NSFR_t * max(0, NSFR_bar - NSFR(w))^2 Liq(w) := Liq_LCR(w) + Liq_NSFR(w)
+# 平方惩罚用于“逼线时非常痛”，让解自动远离红线（治理友好）
+Utility:
+U(w) := E[R(w)] - λ_var_t * Var_proxy(w) - λ_cap_t * Cap(w) - λ_liq_t * Liq(w) IX. STEP 6. STOCK–INCREMENT DUAL-TRACK (EXECUTABLE RULE) Asset growth: ΔA_t := g_t * A_{t-1} A_t  := A_{t-1} + ΔA_t Update rule: w_t = (A_{t-1}/A_t) * w_{t-1} + (ΔA_t/A_t) * Δw_t
+# 关键执行口径：只配置增量ΔA_t，不动存量（避免频繁再平衡带来交易/估值/审批成本）
+Interpretation: - w_{t-1} is inherited smoothly.- Only Δw_t steers new assets.
+- Δw_t must satisfy same feasibility constraints (and practical step caps).
+# Δw_t也应在同一Ω_t内（至少满足治理上限和非负），否则落地时会“增量指令不可执行”
+X. STEP 7. CORE SOLVER: FEASIBLE REGION + BANDWIDTH + DIRECTION ------------------------------------------------------------
+STEP 7.1 Anchor point ------------------------------------------------------------
+Set:
+w_anchor := w_{t-1}  (or observed current weights) If infeasible: Project: w_anchor := argmin_{w ∈ Ω_t} || w - w_{t-1} ||^2
+# 如果当前结构已踩线（现实可能发生），先做最小调整投影回可行域，保证后续线性化有效
+------------------------------------------------------------
+STEP 7.2 Constraint vector g(w) and Jacobian J_g(w_anchor) ------------------------------------------------------------
+Define inequality constraints g(w) <= 0:
+g_CAR(w)   := CAR_bar  - CAR(w)
+g_LCR(w)   := LCR_bar  - LCR(w)
+g_NSFR(w)  := NSFR_bar - NSFR(w)
+g_hi_i(w)  := w_i - w_max_base[i] g_lo_i(w)  := w_min_base[i] - w_i If chance constraints enabled: replace CAR(w), LCR(w), NSFR(w) with quantile-evaluated forms: CAR_qδ(w), LCR_qδ(w), NSFR_qδ(w) and define: g_CAR(w) := CAR_bar - CAR_qδ(w) etc.
+# 这一步把“分位数约束”转成标准不等式，求解器才能统一处理
+Equality constraint handled separately:
+h(w) := Σ_i w_i - 1 = 0
+# 等式约束用拉格朗日乘子ν处理；工程实现上可做“消元”或直接交给QP求解器
+Linearize around anchor:
+g(w_anchor + d) ≈ g(w_anchor) + J_g(w_anchor) * d
+h(w_anchor + d) = 0 implies 1^T d = 0
+# 线性近似以约束边界的一阶展开计算配置带宽。
+------------------------------------------------------------
+STEP 7.3 Local KKT/QP for feasible improvement direction d*------------------------------------------------------------
+Compute gradient:
+gradU := ∇U(w_anchor) Choose stability Hessian H (optional, PSD): H := εI  or approximate curvature proxy
+# H用于稳定方向（防止梯度过激）；εI相当于“最小二乘正则”
+Solve local QP:
+maximize_d   gradU^T d - (1/2) d^T H d
+subject to   g(w_anchor) + J_g d <= 0
+1^T d = 0 ||d|| <= 1
+# 这是“求方向而非求点”的关键：在不碰约束的前提下，找最优可行方向d*
+Obtain:
+d*            : normalized direction (6x1)
+μ             : multipliers for active inequality constraints
+ν             : multiplier for equality (sum-to-one)
+Active set A  : constraints with nonzero μ
+Define reported shadow prices:
+μ_CAR := multiplier attached to g_CAR μ_LCR := multiplier attached to g_LCR μ_NSFR := multiplier attached to g_NSFR
+# μ就是“解释力”：μ_LCR大说明LCR最紧；μ_CAR大说明资本约束在硬化
+------------------------------------------------------------
+STEP 7.4 Boundary hit: maximum step length η_max along d*------------------------------------------------------------
+Compute:
+η_max := +∞ binding_report := empty FOR each inequality constraint j: denom := (J_g_j * d*) IF denom > 0: η_j := (- g_j(w_anchor)) / denom IF η_j < η_max: η_max := η_j binding_report := {j} ELSE IF η_j == η_max: binding_report := binding_report ∪ {j}
+# η_max是“沿d*走到第一个约束碰线”为止的距离 = 局部边界命中（线性近似）
+Boundary point (local approximation):
+w_boundary := w_anchor + η_max * d*
+# 这是局部边界点，可用于画“可行域收缩/边界命中”示意图
+------------------------------------------------------------
+STEP 7.5 Convert direction d* into incremental allocation Δw*_t ------------------------------------------------------------
+Baseline:
+Δw*_t := normalize_to_simplex(d* + base_increment_prior) (if you want pure direction: use Δw*_t := simplex_projection(d*))
+# d*是方向，不一定在单纯形；需要投影/归一化成可执行的Δw（非负、和为1）
+Apply practical step caps:
+Δw*_t := clip(Δw*_t, Δw_min, Δw_max) Ensure simplex: Δw*_t := project_to_simplex(Δw*_t)
+# Δw_min/max是“增量层面”的操作限额（比如单季某类资产新增占比不能超过x%）
+Store:
+η_max and binding_report for explanation.
+XI. STEP 8. BANDWIDTH COMPUTATION (REPORT MODE + HARD MODE) ------------------------------------------------------------
+MODE A: Convex QP scan (deliverable-style) ------------------------------------------------------------
+FOR each asset i in {1..6}:
+# Lower bound:
+Solve:
+minimize_w    w_i + ρ ||w - w_anchor||^2
+subject to    w ∈ Ω_t
+Set:
+w_lower[i] := solution w_i
+# Upper bound:
+Solve:
+maximize_w    w_i - ρ ||w - w_anchor||^2
+subject to    w ∈ Ω_t
+Set:
+w_upper[i] := solution w_i Compute: width[i] := w_upper[i] - w_lower[i]
+# Mode A最适合出“表格交付件”：每类资产上下限+宽度；ρ用于避免其他维度乱跳
+------------------------------------------------------------
+MODE B: Linear boundary approximation + multipliers (面对装懂的人) ------------------------------------------------------------
+Use active set A and linearization:
+Feasible direction cone near anchor:
+J_A d <= 0
+1^T d = 0
+# 只用“活跃约束”描述局部可行方向锥，强调“边界是哪些约束构成的”
+For each i:
+Solve small LP/QP to find marginal room:
+d_i^+ := argmax d_i subject to J_A d <= 0, 1^T d = 0, ||d||_1 <= 1
+d_i^- := argmin d_i subject to same constraints
+Convert marginal direction to weight bounds via η limits:
+w_upper[i] ≈ w_anchor[i] + η_plus[i] * d_i^+
+w_lower[i] ≈ w_anchor[i] + η_minus[i] * d_i^-
+Additionally compute KKT-adjusted marginal score:
+shadow_i := ∂U/∂w_i - Σ_{j∈A} μ_j * ∂g_j/∂w_i
+# shadow_i是“净边际价值”：收益梯度减去约束影子成本；用于解释为什么推不动/该推谁
+Interpret: - sign(shadow_i) suggests push up/down - largest μ_j indicates which constraint blocks movement
+XII. STEP 9. DIAGNOSTICS & GOVERNANCE OUTPUT
+Compute slacks at anchor:
+slack_CAR  := CAR(w_anchor)  - CAR_bar slack_LCR  := LCR(w_anchor)  - LCR_bar slack_NSFR := NSFR(w_anchor) - NSFR_bar
+# 余量slack是领导最爱看的：离红线还有多少
+Feasibility:
+feasible := (all slacks >= 0 and bounds satisfied)
+Stability flags: - if Ω_t empty -> revise proxy inputs / relax δ_t / widen governance bands
+- if most widths collapse -> constraint hardening regime warning
+# Ω_t 为空时返回不可行诊断，并复核代理参数、约束一致性和治理区间。
+Produce outputs:
+Table:
+i, w_anchor[i], w_lower[i], w_upper[i], width[i], main_binding_constraint
+Vector:
+Δw*_t, η_max
+Shadow prices:
+μ_CAR, μ_LCR, μ_NSFR
+Regime:
+s_hat_t, γ_t(·)
+XIII. STEP 10. MPC (ROLLING CONTROL) + RL WEIGHT TUNING (OPTIONAL) ------------------------------------------------------------
+STEP 10A. MPC module (roll horizon, execute first step only)
+------------------------------------------------------------
+IF MPC_module == ON:
+At time t, define horizon k=0..H: Decision sequence: {Δw_{t|t}, Δw_{t+1|t}, ..., Δw_{t+H|t}} State predictions: distributions for {NIM, CAR, LCR, NSFR} over horizon
+# MPC的“重”在于每期滚动预测H期，但只执行第一期；其余作为前瞻约束
+Build MPC objective over horizon:
+maximize  E[ Σ_{k=0..H} β^k U(w_{t+k|t}) ]
+subject to:
+stock–increment update:
+w_{t+k|t} = (A_{t+k-1|t}/A_{t+k|t}) w_{t+k-1|t}+ (ΔA_{t+k|t}/A_{t+k|t}) Δw_{t+k|t}
+chance constraints across horizon:
+q̂_δt(CAR_{t+k|t})  >= CAR_bar, ∀k
+q̂_δt(LCR_{t+k|t})  >= LCR_bar, ∀k
+q̂_δt(NSFR_{t+k|t}) >= NSFR_bar, ∀k
+governance bands and simplex constraints ∀k
+# MPC的价值：避免“当前可行但未来撞线”；尤其适合低利率阶段约束快速硬化
+Solve MPC optimization:
+obtain optimal sequence Δw*_{t:t+H|t}
+Execute only first step:
+Δw*_t := Δw*_{t|t} Advance: t := t+1, re-ingest new data, repeat.ELSE: Use single-period solver (Step 7/8) for Δw*_t and bandwidth.------------------------------------------------------------
+STEP 10B. RL module (ONLY tunes penalty weights λ; never outputs weights)
+------------------------------------------------------------
+IF RL_tuning_module == ON:
+Define RL state sRL_t:
+sRL_t := [γ_t(1), γ_t(2), γ_t(3), NIM_t, CAR_t, LCR_t, NSFR_t, bandwidth widths summary, recent constraint violations / near-miss indicators]
+# RL状态要反映“阶段+逼线程度+带宽收缩”，这样RL调参才有意义
+Define RL action a_t:
+a_t := adjustments to penalty weights (bounded): λ_var_t, λ_cap_t, λ_liq_t, κ_LCR_t, κ_NSFR_t, cK_t with hard bounds to preserve governance: λ_min <= λ <= λ_max
+# 需加上下限/上限，防止RL把权重调到极端导致解不稳定或过度保守
+Define reward r_t (governance-consistent):
+r_t := ProfitProxy_t - penalty_violation * (indicator of CAR/LCR/NSFR breach or near-breach) - penalty_instability * turnover_proxy(Δw*_t) - penalty_vol * risk_proxy(w_t)
+# reward需把“合规/稳定性”写进负奖励，否则RL会受收益目标驱动逼线甚至越线
+RL update rule:
+update policy π(a | sRL) to maximize E[Σ ρ^k r_{t+k}]
+# 方法可选（PPO/DDPG/Q-learning），但输出只能是惩罚参数
+Apply RL output ONLY as parameters for next solve:
+(λ_var_t, λ_cap_t, λ_liq_t, κ_LCR_t, κ_NSFR_t, cK_t) := policy(sRL_t) IMPORTANT GOVERNANCE: - RL never modifies Ω_t constraints.- RL never directly produces w_t or Δw_t.- RL only tunes penalty weights used inside U(w) and shortfall penalties.
+# 治理边界：RL 仅调节惩罚权重，不修改硬约束或直接生成资产权重。
+ELSE:
+Keep penalty weights fixed or regime-adjusted via γ_t only.
+XIV. MAIN LOOP (END-TO-END EXECUTION)
+INITIALIZE:
+Set initial w_0 from report mapping.
+Set baseline penalties λ_0, κ_0, δ_base, cK_0.
+Initialize optional module states:
+HMM parameters, Bayesian priors, ML models, RL policy.
+# 初始化要把“口径映射、参数先验、模型缓存”准备好，集中存放于 Config 对象
+FOR each t in T:
+1) Ingest data (STEP 1)
+2) Build NIM state & repricing mechanism (STEP 2)
+3) Optional: HMM regime probabilities γ_t (STEP 3A)
+4) Optional: Bayesian parameter update θ_t (STEP 3B)
+5) Optional: ML quantile forecasts (STEP 3C)
+6) Fuse distributions & set δ_t (STEP 3D)
+7) Optional: RL tunes λ_t, κ_t, cK_t based on sRL_t (STEP 10B)
+8) Build constraints Ω_t with chance constraints if enabled (STEP 4)
+9) Solve:
+IF MPC ON: solve MPC and execute first Δw*_t (STEP 10A)
+ELSE: compute local KKT direction + bandwidth (STEP 7/8)
+10) Update weights using dual-track rule (STEP 6)
+11) Produce governance outputs, shadow prices, binding report (STEP 9)
+# 执行顺序：学习与预测、构造 Ω_t、更新惩罚参数、求解配置。
+END FOR
+END ALGORITHM
+A7 外部利率阶段识别与 NIM 内部校准算法（7天期逆回购利率、1Y LPR、DR007、10Y国债收益率与NIM联合判定）
+(
+Input:
+Repo7D_t      : 人民银行7天期逆回购利率序列
+LPR1_t        : 1 年期 LPR 序列
+DR007_t       : DR007 季度均值及波动指标
+Y10_t         : 10 年期国债收益率季度均值及波动指标
+NIM_t         : 银行净息差序列
+PersistK      : 阶段持续期要求
+StageRef      : 4%、3%、2%、1%、0%及负利率阶段参考区间
+WeightSet     : 外部利率信号权重，权重和为 1
+Output:
+RateStage_t   : 外部利率阶段标签
+NIMState_t    : 内部经营状态
+Divergence_t  : 外部环境与内部经营结果偏离标记
+Scenario_t    : 下行、波动或压力切换情景
+SwitchFlag_t  : 阶段切换信号)
+STEP 0. 数据频率对齐
+Repo7D_q = QuarterEnd[Repo7D_t];
+LPR1_q   = QuarterEnd[LPR1_t];
+DR007_q = <|"Mean"->QuarterMean[DR007_t], "Vol"->QuarterVol[DR007_t]|>;
+Y10_q   = <|"Mean"->QuarterMean[Y10_t], "Vol"->QuarterVol[Y10_t]|>;
+NIM_q   = AnnualizeAndAlign[NIM_t];
+# 高频利率聚合至季度，NIM 统一年化口径。
+STEP 1. 单指标阶段映射
+Stage_Repo = MapToStage[Repo7D_q, StageRef["Repo7D"]];
+Stage_LPR  = MapToStage[LPR1_q, StageRef["LPR1"]];
+Stage_DR   = MapToStage[DR007_q["Mean"], StageRef["DR007"]];
+Stage_Y10  = MapToStage[Y10_q["Mean"], StageRef["Y10"]];
+NIMState_t = MapToState[NIM_q, StageRef["NIM"]];
+# 参考区间采用正文表 9-7 的管理口径。
+STEP 2. 外部利率阶段合成
+StageScore_t = WeightSet["Repo"]*Stage_Repo + WeightSet["LPR"]*Stage_LPR + WeightSet["DR"]*Stage_DR + WeightSet["Y10"]*Stage_Y10;
+RateStageRaw_t = NearestStage[StageScore_t];
+RateStage_t = PersistenceFilter[RateStageRaw_t, PersistK];
+# 7天期逆回购利率为政策锚，DR007校准货币市场运行，LPR反映贷款定价阶段，10年期国债收益率校准长端环境。
+STEP 3. NIM 内部校准与偏离识别
+Divergence_t = NIMState_t - ExpectedNIMState[RateStage_t];  # 状态值越大表示经营压力越高
+IF Abs[Divergence_t] <= Tolerance: InternalFlag_t = "Matched";
+IF Divergence_t >  Tolerance: InternalFlag_t = "PressureAhead";
+IF Divergence_t < -Tolerance: InternalFlag_t = "BufferAvailable";
+# NIM 校准经营压力，不覆盖外部利率阶段标签。
+STEP 4. 情景切换
+Scenario_t = "Baseline";
+IF StageDown[RateStage_t] AND NIMPressureUp[NIMState_t]:
+Scenario_t = "PressureSwitch";
+ELSE IF VolUp[DR007_q["Vol"]] OR VolUp[Y10_q["Vol"]]:
+Scenario_t = "Volatility";
+ELSE IF TrendDown[Repo7D_q] OR TrendDown[LPR1_q] OR TrendDown[Y10_q["Mean"]]:
+Scenario_t = "Downward";
+SwitchFlag_t = ConfirmByPersistence[Scenario_t, PersistK];
+OUTPUT PACK
+Result = <|"RateStage"->RateStage_t, "NIMState"->NIMState_t, "Divergence"->Divergence_t, "Scenario"->Scenario_t, "SwitchFlag"->SwitchFlag_t|>;
+A8 风险调整后收益与资本占用效率辅助诊断算法（RORAC、RORWA 与相对排序）
+(
+Input:
+BucketSet       : 六大类资产及关键二类资产集合
+Income_i        : 利息、票息、交易和服务收入（若已扣除减值损失需标记）
+IncomeIncludesImpairment_i : Income_i是否已包含减值损失
+Exposure_i      : 资产暴露余额
+RiskClass_i, Duration_i : 经济资本代理所需风险类别与期限
+FundingCost_i   : FTP 资金成本及期限、流动性成本
+OpCost_i        : 运营与管理成本
+EL_i            : 预期损失或审慎代理值
+RWA_i           : 风险加权资产或公开口径代理值
+EconCapital_i   : 经济资本；缺失时采用区间代理
+Liquidity_i     : HQLA价值、LCR影响、RSF占用和流动性成本的分项指标
+Customer_i      : 客户综合贡献
+DataFlag_i      : 披露值、测算值或估算值标记
+Output:
+RORAC_i         : 风险调整后资本收益率区间
+RORWA_i         : 单位风险加权资产收益率区间
+CapitalIntensity_i : 资本占用强度
+DirectionIndex_i   : 相对配置方向指数
+RankTable       : 资产相对排序与边界说明)
+STEP 0. 数据性质标记
+For each i in BucketSet:
+Record DataFlag_i ∈ {"Disclosed", "Calculated", "Estimated"};
+Build Low/Base/High parameter bands for unavailable items;
+# 公开数据不足的项目采用区间估算，并保留数据性质标记。
+STEP 1. 风险调整后净收益
+ELAdj_i = If[IncomeIncludesImpairment_i, 0, EL_i];  NetRAR_i = Income_i - FundingCost_i - OpCost_i - ELAdj_i;
+STEP 2. RORWA 与 RORAC
+IF RWA_i > RWAEpsilon: RORWA_i = NetRAR_i/RWA_i; ELSE: RORWA_i = NotApplicable["RWA接近零"];
+IF EconCapital_i is available:
+RORAC_i = NetRAR_i / EconCapital_i;
+ELSE:
+EconCapitalBand_i = CapitalProxy[RWA_i, RiskClass_i, Duration_i, Liquidity_i];
+RORAC_i = Interval[NetRAR_i / EconCapitalBand_i];
+CapitalIntensity_i = RWA_i / Exposure_i;
+STEP 3. 相对指数标准化
+RORWAIndex_i = If[ApplicableQ[RORWA_i], 100*RORWA_i/RORWA_AllBank, NotApplicable[]];
+RORACIndex_i = 100 * RORAC_i / RORAC_AllBank;
+CapitalIndex_i = 100 * CapitalIntensity_i / CapitalIntensity_AllBank;
+DirectionIndex_i = RankBy[StandardizeComparable[{RORACIndex_i, RORWAIndex_i, -CapitalIndex_i, Liquidity_i, Customer_i}], ExcludeNotApplicable -> True];
+# 指数用于相对排序，硬约束仍由 CAR、CET1、LCR、NSFR 和风险限额确定。
+STEP 4. 方向识别
+IF RORACIndex_i high AND RORWAIndex_i high AND CapitalIndex_i acceptable:
+Action_i = "IncreaseOrMaintain";
+IF return adequate BUT capital/liquidity consumption high:
+Action_i = "RepriceOrRestructure";
+IF risk compensation insufficient OR migration deteriorates:
+Action_i = "ReduceOrExit";
+OUTPUT PACK
+Result = <|
+"RORAC"->RORAC_i,
+"RORWA"->RORWA_i,
+"CapitalIntensity"->CapitalIntensity_i,
+"DirectionIndex"->DirectionIndex_i,
+"Action"->Action_i,
+"DataFlag"->DataFlag_i|>;
+A9 存量资产四类池与新增资源五道准入闸门（存量迁移、二类资产清单与增量准入）
+(
+Input:
+AssetList       : 存量资产和拟新增资产清单
+FTPNetReturn_j  : FTP 后净收益
+RORAC_j, RORWA_j, RWAIntensity_j
+CashFlow_j, Duration_j, NSFRUse_j, Liquidity_j
+EL_j, Migration_j, ValuationVol_j, Concentration_j
+CustomerValue_j : 结算、存款、托管、承销、财富管理和综合收入贡献
+ThresholdSet    : 收益、资本、流动性、风险与客户价值门槛
+Output:
+StockPool_j     : 稳定持有池、重估优化池、压降置换池或退出处置池
+TierList_j      : 优先配置名单、观察复核名单或压降退出名单
+GateResult_j    : 五道闸门逐项结果
+Action_j        : 续作、重定价、缩期、置换、压降或退出)
+STEP 1. 存量资产四类池
+IF CashFlow stable AND return covers cost AND risk controlled AND CustomerValue strong:
+StockPool_j = "StableHold";
+ELSE IF repair potential exists AND asset quality acceptable:
+StockPool_j = "RevalueOptimize";
+ELSE IF compensation insufficient OR NSFRUse high OR Migration rising:
+StockPool_j = "ReduceReplace";
+ELSE IF cash flow deteriorates AND return fails to cover risk and capital cost:
+StockPool_j = "ExitDispose";
+STEP 2. 重点二类资产分层清单
+IF risk compensation weak OR capital efficiency low:
+TierList_j = "ReduceExit";
+ELSE IF DirectionIndex_j high AND all limits available:
+TierList_j = "Priority";
+ELSE:
+TierList_j = "Review";
+IF TierList_j == "Review" AND no improvement for ReviewPeriods:
+TierList_j = "ReduceExit";
+IF TierList_j == "ReduceExit" AND compensation, customer value and capital efficiency recover:
+TierList_j = "Review";
+STEP 3. 新增资源五道准入闸门
+Gate1_Return     = FTPNetReturn_j covers funding, operating and management costs;
+Gate2_Capital    = RORAC_j and RORWA_j meet internal requirements;
+Gate3_Liquidity  = NSFRUse_j, duration and stress cash flow remain acceptable;
+Gate4_Risk       = EL_j, Migration_j, valuation risk and concentration remain within limits;
+Gate5_StrategicOperational = If[CustomerSuitabilityApplicable_j, CustomerValue_j identifiable AND product suitability adequate, LegalCompliance_j AND DataValuationCapability_j];
+GateResult_j = {Gate1_Return, Gate2_Capital, Gate3_Liquidity, Gate4_Risk, Gate5_StrategicOperational};
+STEP 4. 执行动作
+FailedGates_j = Pick[{"Return","Capital","Liquidity","Risk","StrategicOperational"}, Not /@ GateResult_j];
+IF FailedGates_j == {}:
+Action_j = {"ApproveAndAllocate"};
+ELSE:
+Action_j = MapGateFailureToActions[FailedGates_j];
+# 多道闸门同时失败时并列输出全部整改动作，不由第一条ELSE IF覆盖其余问题。
+OUTPUT PACK
+Result = <|"StockPool"->StockPool_j, "TierList"->TierList_j, "GateResult"->GateResult_j, "Action"->Action_j|>;
+A10 回测、触发与滚动校准算法（外部利率、经营结果与约束边界三类信号）
+(
+Input:
+AllocationPlan_t : 配置区间、增量方向和存量迁移计划
+ActualResult_t   : 实际资产结构、收益、资本、流动性、风险和协同指标
+ExternalSignal_t : LPR、DR007、10 年期国债收益率、收益率曲线和市场波动
+OperatingSignal_t: NIM、利息净收入、手续费收入和负债成本
+ConstraintSignal_t: CET1、CAR、LCR、NSFR、久期、估值、保证金、迁徙和声誉风险
+TriggerSet       : 正文或内部管理口径设定的触发阈值
+ReviewCycle      : 年度、季度、月度和日常触发频率
+Output:
+BacktestTable    : 计划值、实际值与偏差归因
+TriggerLevel     : 正常、关注、预警或压力
+CorrectionAction : 增量重排、存量迁移、FTP 调整、风险预算调整和安全底座补充
+ParameterUpdate  : HMM、贝叶斯、分位数预测、MPC 和 RL 参数更新)
+STEP 1. 多维回测
+BacktestDimension = {Return, Capital, Liquidity, StableFunding, Risk, Valuation, Collaboration, CustomerValue};
+For each d in BacktestDimension:
+Deviation_d = ActualResult_t[d] - AllocationPlan_t[d];
+Attribution_d = AttributeTo{AssetSupply, Execution, RateChange, CapitalTightening, LiquidityTightening, RiskMigration};
+STEP 2. 三类触发信号
+ExternalFlag  = Evaluate[ExternalSignal_t, TriggerSet["External"]];
+OperatingFlag = Evaluate[OperatingSignal_t, TriggerSet["Operating"]];
+ConstraintFlag= Evaluate[ConstraintSignal_t, TriggerSet["Constraint"]];
+IF AnyHardLimitBreached[ConstraintSignal_t, TriggerSet["HardConstraint"]]: TriggerLevel = "Pressure"; ELSE: TriggerLevel = AggregateSeverity[ExternalFlag, OperatingFlag, ConstraintFlag];
+# 具体阈值沿用正文或内部管理口径，算法层不新增数值。
+STEP 3. 纠偏动作映射
+IF NIM pressure rises: Reduce low-efficiency assets; increase stable coupon and service income contribution;
+IF capital pressure rises: Raise RORAC threshold; control high-RWA assets;
+IF NSFR pressure rises: Control high-RSF and long-duration assets; increase stable deposits or longer-term funding;
+IF market risk rises: Shorten duration; reduce DV01 and directional exposure; strengthen hedging;
+IF credit migration rises: Tighten sector limits; move assets to Watch/ReduceExit lists;
+IF collaboration income weakens: Adjust product and customer service mix;
+STEP 4. 运行节奏
+Annual: set risk appetite, allocation bands, capital budget, liquidity floor and collaboration targets;
+Quarterly: review rate stage, NIM, CET1, CAR, LCR, NSFR, duration gap and allocation deviation;
+Monthly: update new-asset admission, stock migration, low-efficiency warnings, limits and FTP curve;
+DailyTrigger: monitor market, liquidity, valuation and limit signals; escalate material events, while full allocation-band re-optimization remains monthly/quarterly;
+STEP 5. 参数与计划更新
+Propose HMM transition and stage-probability updates after data-quality and stability checks;
+Propose Bayesian/Kalman parameter updates after out-of-sample validation;
+Retrain or recalibrate quantile forecasts when forecast error exceeds tolerance;
+Update MPC state and execute the first-period correction;
+Update RL penalty weights only after independent validation, governance approval and rollback readiness;
+AllocationPlan_{t+1} = ReSolve[A6, UpdatedInputs];
+Backtest uses only data and parameter versions available at each historical decision date; full-sample smoothed states are excluded from real-time backtest signals.
+OUTPUT PACK
+Result = <|"Backtest"->BacktestTable, "TriggerLevel"->TriggerLevel, "CorrectionAction"->CorrectionAction, "ParameterUpdate"->ParameterUpdate|>;
